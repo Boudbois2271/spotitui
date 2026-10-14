@@ -373,10 +373,13 @@ impl Daemon {
     /// what changed).
     async fn liked(&self, catalog: &Catalog) -> std::result::Result<spotify::Liked, spotify::Error> {
         let kept = self.state().liked.take();
-        if let Some(mut liked) = kept
-            && catalog.update_liked(&mut liked).await?
-        {
-            return Ok(liked);
+        if let Some(mut liked) = kept {
+            match catalog.update_liked(&mut liked).await {
+                Ok(true) => return Ok(liked),
+                Ok(false) => {}
+                // An expired sync token may be refused outright; a full read still works.
+                Err(error) => log::info!("cannot update Liked Songs ({error}); reading it again"),
+            }
         }
         let liked = catalog.liked().await?;
         log::info!("read Liked Songs: {} items", liked.len());
