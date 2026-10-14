@@ -126,6 +126,9 @@ pub enum Msg {
     },
     Tracks {
         generation: u64,
+        /// The row the chunk starts at, and its URIs.
+        start: usize,
+        chunk: Vec<String>,
         result: Result<Vec<Track>, Failure>,
     },
     Lyrics {
@@ -294,19 +297,23 @@ impl App {
                     self.listing.loading = Loading::Idle;
                     self.load_more();
                 }
-                Err(error) => self.listing.loading = Loading::Failed(error),
+                Err(error) => self.listing.fail(error),
             },
-            Msg::Tracks { generation, result } if generation == self.generation => match result {
+            Msg::Tracks {
+                generation,
+                start,
+                chunk,
+                result,
+            } if generation == self.generation => match result {
                 Ok(tracks) => {
-                    self.listing.tracks.extend(tracks.into_iter().map(Rc::new));
-                    self.listing.loading = Loading::Idle;
+                    self.listing.take_chunk(start, &chunk, tracks);
                     if self.to_end {
                         self.window.step(Step::Bottom, self.listing.tracks.len());
                     }
                     self.refilter();
                     self.load_more();
                 }
-                Err(error) => self.listing.loading = Loading::Failed(error),
+                Err(error) => self.listing.fail(error),
             },
             // Results for a list the user already left.
             Msg::Uris { .. } | Msg::Tracks { .. } => {}
@@ -353,8 +360,12 @@ impl App {
                 self.liked_uri = Some(liked_uri);
                 if !in_library {
                     self.enter_library();
-                } else if self.playlists.is_empty() {
-                    self.load_playlists();
+                } else {
+                    if self.playlists.is_empty() {
+                        self.load_playlists();
+                    }
+                    // Back after a reconnect: a list that failed meanwhile loads again.
+                    self.retry();
                 }
             }
             Status::Connecting if in_library => self.inform("Reconnecting to Spotify…"),
@@ -467,6 +478,14 @@ impl App {
         true
     }
 
+    /// Loads a failed list again, from where it stopped.
+    fn retry(&mut self) {
+        if matches!(self.listing.loading, Loading::Failed(_)) {
+            self.listing.loading = Loading::Idle;
+            self.reload();
+        }
+    }
+
     /// Restarts loading a list whose request was dropped.
     fn reload(&mut self) {
         if self.listing.uris.is_empty() {
@@ -494,6 +513,10 @@ impl App {
 
     /// Loads the details of the next tracks, if the window is close to the loaded end.
     pub fn load_more(&mut self) {
+        if self.listing.retry_due() {
+            self.retry();
+            return;
+        }
         if self.listing.loading != Loading::Idle {
             return;
         }
@@ -514,8 +537,13 @@ impl App {
         let generation = self.generation;
         let (tx, service) = (self.tx.clone(), self.service.clone());
         tokio::spawn(async move {
-            let result = service.tracks(chunk).await;
-            let _ = tx.send(Msg::Tracks { generation, result });
+            let result = service.tracks(chunk.clone()).await;
+            let _ = tx.send(Msg::Tracks {
+                generation,
+                start,
+                chunk,
+                result,
+            });
         });
     }
 
@@ -561,6 +589,8 @@ impl App {
             self.open_shelf(index);
             return;
         }
+        // Entering a list that failed to load tries again.
+        self.retry();
         self.sidebar.select(index, self.shelf_count());
         self.view = View::Tracks;
         self.focus = match &self.listing.source {

@@ -115,6 +115,16 @@ impl Failure {
     }
 }
 
+impl Failure {
+    /// Whether the same request may work later without the user doing anything.
+    pub fn is_transient(&self) -> bool {
+        matches!(
+            self.kind,
+            Kind::NotConnected | Kind::ServiceDown | Kind::Network | Kind::RateLimited
+        )
+    }
+}
+
 impl std::fmt::Display for Failure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str(&self.message)

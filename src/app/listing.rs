@@ -6,7 +6,17 @@ use crate::{
     protocol::Failure,
     spotify::{Album, Artist, Playlist, Track},
 };
-use std::{ops::Range, rc::Rc};
+use std::{
+    collections::HashSet,
+    ops::Range,
+    rc::Rc,
+    time::{Duration, Instant},
+};
+
+/// The first wait before loading again after a temporary failure; it doubles
+/// with each failure in a row, up to [`RETRY_MAX`].
+const RETRY_FIRST: Duration = Duration::from_secs(5);
+const RETRY_MAX: Duration = Duration::from_secs(60);
 
 /// Something the main pane can list.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -34,6 +44,9 @@ pub struct Listing {
     pub tracks: Vec<Rc<Track>>,
     pub requested: usize,
     pub loading: Loading,
+    /// When the last failure happened, and how many failed in a row.
+    failed_at: Option<Instant>,
+    failures: u32,
 }
 
 /// How a key or the wheel moves a selection.
@@ -143,7 +156,61 @@ impl Listing {
             tracks: Vec::new(),
             requested: 0,
             loading: Loading::Busy,
+            failed_at: None,
+            failures: 0,
         }
+    }
+
+    pub fn fail(&mut self, failure: Failure) {
+        self.loading = Loading::Failed(failure);
+        self.failed_at = Some(Instant::now());
+        self.failures = self.failures.saturating_add(1);
+    }
+
+    /// Whether a failure is temporary and has waited long enough to try again.
+    pub fn retry_due(&self) -> bool {
+        let Loading::Failed(failure) = &self.loading else {
+            return false;
+        };
+        let wait = RETRY_FIRST
+            .saturating_mul(2u32.saturating_pow(self.failures.saturating_sub(1)))
+            .min(RETRY_MAX);
+        failure.is_transient() && self.failed_at.is_some_and(|at| at.elapsed() >= wait)
+    }
+
+    /// Takes the details of the URIs `chunk`, asked for from row `start`. Tracks
+    /// Spotify couldn't describe are left out of the list too, so every row has
+    /// its track and later loads ask for the right ones.
+    pub fn take_chunk(&mut self, start: usize, chunk: &[String], found: Vec<Track>) {
+        if start != self.tracks.len() {
+            return;
+        }
+        let asked: HashSet<&str> = chunk.iter().map(String::as_str).collect();
+        let found: Vec<Track> = found
+            .into_iter()
+            .filter(|track| asked.contains(track.uri.as_str()))
+            .collect();
+        if found.len() != chunk.len() {
+            let kept: HashSet<&str> = found.iter().map(|track| track.uri.as_str()).collect();
+            let after = (start + chunk.len()).min(self.uris.len());
+            let uris: Vec<String> = self.uris[..start]
+                .iter()
+                .chain(chunk.iter().filter(|uri| kept.contains(uri.as_str())))
+                .chain(&self.uris[after..])
+                .cloned()
+                .collect();
+            log::info!(
+                "{} of {} tracks have no details; left out",
+                chunk.len() - found.len(),
+                chunk.len()
+            );
+            self.uris = uris.into();
+        }
+        self.tracks.extend(found.into_iter().map(Rc::new));
+        self.requested = self.tracks.len();
+        self.loading = Loading::Idle;
+        self.failed_at = None;
+        self.failures = 0;
     }
 
     pub fn summary(&self) -> String {
@@ -173,7 +240,73 @@ pub fn duration(milliseconds: u64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Step, Window, duration};
+    use super::{Listing, Loading, Source, Step, Window, duration};
+    use crate::{
+        protocol::{Failure, Kind},
+        spotify::{Album, Track},
+    };
+    use std::time::{Duration, Instant};
+
+    fn track(uri: &str) -> Track {
+        Track {
+            uri: uri.into(),
+            name: uri.into(),
+            artists: Vec::new(),
+            album: Album {
+                uri: "spotify:album:a".into(),
+                name: "A".into(),
+            },
+            duration_ms: 1,
+        }
+    }
+
+    fn listing(count: usize) -> Listing {
+        let mut listing = Listing::new(Source::Liked);
+        listing.uris = (0..count).map(|i| format!("spotify:track:{i}")).collect();
+        listing.loading = Loading::Idle;
+        listing
+    }
+
+    #[test]
+    fn rows_stay_with_their_tracks_when_some_have_no_details() {
+        let mut listing = listing(6);
+        let chunk: Vec<String> = listing.uris[0..3].to_vec();
+        listing.requested = 3;
+        // Spotify knows nothing about track 1.
+        listing.take_chunk(0, &chunk, vec![track("spotify:track:0"), track("spotify:track:2")]);
+        assert_eq!(listing.tracks.len(), 2);
+        assert_eq!(listing.requested, 2);
+        assert_eq!(
+            listing.uris.iter().map(String::as_str).collect::<Vec<_>>(),
+            ["spotify:track:0", "spotify:track:2", "spotify:track:3", "spotify:track:4", "spotify:track:5"]
+        );
+        // The next chunk starts at the right row: nothing loads twice.
+        let next: Vec<String> = listing.uris[2..5].to_vec();
+        assert_eq!(next[0], "spotify:track:3");
+        listing.take_chunk(2, &next, next.iter().map(|uri| track(uri)).collect());
+        let rows: Vec<&str> = listing.tracks.iter().map(|track| track.uri.as_str()).collect();
+        assert_eq!(&rows[..], &listing.uris[..5]);
+        // A late answer for an older position is ignored.
+        listing.take_chunk(0, &chunk, vec![track("spotify:track:0")]);
+        assert_eq!(listing.tracks.len(), 5);
+    }
+
+    #[test]
+    fn only_temporary_failures_retry_and_they_wait_longer_each_time() {
+        let mut listing = listing(3);
+        listing.fail(Failure::new(Kind::Network, "offline"));
+        assert!(!listing.retry_due(), "not right away");
+        listing.failed_at = Some(Instant::now() - Duration::from_secs(5));
+        assert!(listing.retry_due());
+        listing.fail(Failure::new(Kind::Network, "offline"));
+        listing.failed_at = Some(Instant::now() - Duration::from_secs(6));
+        assert!(!listing.retry_due(), "the second wait is 10 s");
+        listing.failed_at = Some(Instant::now() - Duration::from_secs(10));
+        assert!(listing.retry_due());
+        listing.fail(Failure::new(Kind::Other, "broken"));
+        listing.failed_at = Some(Instant::now() - Duration::from_secs(600));
+        assert!(!listing.retry_due(), "a lasting failure waits for the user");
+    }
 
     #[test]
     fn durations_use_minutes_and_hours() {
