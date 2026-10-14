@@ -118,10 +118,13 @@ async fn serve_window(daemon: Arc<Daemon>, stream: UnixStream) {
     let _ = writer.await;
 }
 
-fn too_old() -> String {
-    format!(
+fn too_old() -> protocol::Failure {
+    protocol::Failure::new(
+        protocol::Kind::Unsupported,
+        format!(
         "The spotitui service doesn't know this request; it is older than this window \
          (protocol {}). Restart it: systemctl --user restart spotitui",
-        protocol::VERSION
+            protocol::VERSION
+        ),
     )
 }

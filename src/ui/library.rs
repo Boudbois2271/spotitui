@@ -163,7 +163,7 @@ fn track_table(frame: &mut Frame, app: &mut App, area: Rect) {
         .resize(usize::from(inner.height.saturating_sub(1)));
     if app.listing.tracks.is_empty() {
         let (text, style) = match &app.listing.loading {
-            Loading::Failed(error) => (error.clone(), Style::new().fg(theme.error)),
+            Loading::Failed(error) => (error.message.clone(), Style::new().fg(theme.error)),
             _ if app.listing.is_empty() => (
                 app.listing.source.empty_message().into(),
                 Style::new().fg(theme.subtext),

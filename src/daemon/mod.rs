@@ -5,7 +5,7 @@ mod server;
 mod state;
 
 use crate::{
-    protocol::{self, Event, PlayerUpdate, Request, Response, Status},
+    protocol::{self, Event, Failure, Kind, PlayerUpdate, Request, Response, Status},
     spotify::{
         self, Catalog, Command, Connection, Lyrics, Speaker, Token,
         mpris::{self, Mpris, SpircSlot},
@@ -142,7 +142,7 @@ impl Daemon {
         self.broadcast(Event::Status(status));
     }
 
-    fn catalog(&self) -> std::result::Result<Catalog, String> {
+    fn catalog(&self) -> std::result::Result<Catalog, Failure> {
         self.state()
             .live
             .as_ref()
@@ -150,7 +150,7 @@ impl Daemon {
             .ok_or_else(not_connected)
     }
 
-    fn speaker(&self) -> std::result::Result<Arc<Speaker>, String> {
+    fn speaker(&self) -> std::result::Result<Arc<Speaker>, Failure> {
         self.state()
             .live
             .as_ref()
@@ -159,8 +159,8 @@ impl Daemon {
     }
 
     /// Answers one request from a window.
-    pub async fn handle(&self, request: Request) -> std::result::Result<Response, String> {
-        let text = |error: spotify::Error| error.to_string();
+    pub async fn handle(&self, request: Request) -> std::result::Result<Response, Failure> {
+        let text = |error: spotify::Error| failure(&error);
         match request {
             Request::Playlists => {
                 let playlists = self.catalog()?.playlists().await.map_err(text)?;
@@ -242,7 +242,7 @@ impl Daemon {
                         .await
                     {
                         log::warn!("cannot add {track} to {playlist}: {error}");
-                        failed.push(error.to_string());
+                        failed.push(failure(&error));
                     }
                 }
                 match failed.first() {
@@ -267,7 +267,7 @@ impl Daemon {
         }
     }
 
-    fn command(&self, command: Command) -> std::result::Result<Response, String> {
+    fn command(&self, command: Command) -> std::result::Result<Response, Failure> {
         if let Command::Volume(volume) = command {
             // Kept for when the speaker becomes active, and for the next connection.
             self.state().wanted_volume = Some(volume);
@@ -280,7 +280,7 @@ impl Daemon {
         }
         self.speaker()?
             .command(command)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| failure(&error))?;
         Ok(Response::Done)
     }
 
@@ -326,19 +326,47 @@ impl Daemon {
 }
 
 /// Spotify reads an empty URI in a reordered queue as "the current track".
-fn check_track(uri: &str) -> std::result::Result<(), String> {
+fn check_track(uri: &str) -> std::result::Result<(), Failure> {
     let playable = ["spotify:track:", "spotify:episode:"]
         .iter()
         .any(|prefix| uri.strip_prefix(prefix).is_some_and(|id| !id.is_empty()));
     if playable {
         Ok(())
     } else {
-        Err(format!("Can't queue {uri:?}: not a track"))
+        Err(Failure::new(
+            Kind::Other,
+            format!("Can't queue {uri:?}: not a track"),
+        ))
     }
 }
 
-fn not_connected() -> String {
-    "spotitui isn't connected to Spotify right now".into()
+fn not_connected() -> Failure {
+    Failure::new(
+        Kind::NotConnected,
+        "spotitui isn't connected to Spotify right now",
+    )
+}
+
+/// What a window needs to know about a failure: its message and what kind it is.
+fn failure(error: &spotify::Error) -> Failure {
+    use librespot_core::error::ErrorKind;
+    let kind = match error {
+        spotify::Error::Unauthorized => Kind::NeedsLogin,
+        spotify::Error::Network(error) if error.status().is_some_and(|s| s.as_u16() == 429) => {
+            Kind::RateLimited
+        }
+        spotify::Error::Network(_) | spotify::Error::Lrclib(_) => Kind::Network,
+        spotify::Error::Librespot(error) => match error.kind {
+            ErrorKind::ResourceExhausted => Kind::RateLimited,
+            ErrorKind::NotFound => Kind::NotFound,
+            ErrorKind::Unavailable | ErrorKind::DeadlineExceeded | ErrorKind::Aborted => {
+                Kind::Network
+            }
+            _ => Kind::Other,
+        },
+        _ => Kind::Other,
+    };
+    Failure::new(kind, error.to_string())
 }
 
 /// Keeps a session to Spotify for as long as the service runs: logs in with the
@@ -355,7 +383,7 @@ async fn supervise(daemon: Arc<Daemon>, mpris: Option<Arc<Mpris>>) {
             }
             // The keyring may still be locked right after login.
             Err(error) => {
-                daemon.set_status(Status::Failed(error.to_string()));
+                daemon.set_status(Status::Failed(failure(&error)));
                 wait(&daemon, &mut failures).await;
                 continue;
             }
@@ -369,7 +397,7 @@ async fn supervise(daemon: Arc<Daemon>, mpris: Option<Arc<Mpris>>) {
             }
             Err(error) => {
                 log::warn!("cannot connect to Spotify: {error}");
-                daemon.set_status(Status::Failed(error.to_string()));
+                daemon.set_status(Status::Failed(failure(&error)));
                 wait(&daemon, &mut failures).await;
             }
         }
@@ -460,5 +488,21 @@ fn set_slot(slot: &SpircSlot, spirc: Option<Arc<librespot_connect::Spirc>>) {
     match slot.write() {
         Ok(mut current) => *current = spirc,
         Err(poisoned) => *poisoned.into_inner() = spirc,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Kind, failure};
+    use crate::spotify::Error;
+
+    #[test]
+    fn failures_say_what_kind_they_are() {
+        assert_eq!(failure(&Error::Unauthorized).kind, Kind::NeedsLogin);
+        let not_found = librespot_core::Error::not_found("no lyrics");
+        assert_eq!(failure(&Error::Librespot(not_found)).kind, Kind::NotFound);
+        let busy = librespot_core::Error::resource_exhausted("429");
+        assert_eq!(failure(&Error::Librespot(busy)).kind, Kind::RateLimited);
+        assert_eq!(failure(&Error::NoAudio).kind, Kind::Other);
     }
 }

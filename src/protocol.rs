@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped whenever a message changes shape, so a window and a service built from
 /// different versions notice it instead of misreading each other.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// What a window shows when it and the service speak different versions.
 pub fn mismatch(service: u32) -> String {
@@ -80,11 +80,52 @@ pub enum Response {
     },
 }
 
+/// Why a request failed, in a form a window can act on.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Failure {
+    pub kind: Kind,
+    /// Shown to the user as is.
+    pub message: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// The login is gone or was refused; only logging in again helps.
+    NeedsLogin,
+    /// The service has no session to Spotify right now; it reconnects by itself.
+    NotConnected,
+    /// The window can't reach the service.
+    ServiceDown,
+    /// The network or Spotify didn't answer; trying again may work.
+    Network,
+    /// Spotify asked to slow down.
+    RateLimited,
+    NotFound,
+    /// The other side is a different version and doesn't know the message.
+    Unsupported,
+    Other,
+}
+
+impl Failure {
+    pub fn new(kind: Kind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
 pub enum ServerMessage {
     Reply {
         id: u64,
-        result: Result<Response, String>,
+        result: Result<Response, Failure>,
     },
     Event(Event),
 }
@@ -103,8 +144,9 @@ pub enum Status {
     Connecting,
     /// No login stored; the window shows its login screen.
     LoggedOut,
-    /// The last attempt failed; the service tries again by itself.
-    Failed(String),
+    /// The last attempt failed; the service tries again by itself unless the
+    /// failure's kind is [`Kind::NeedsLogin`].
+    Failed(Failure),
     Connected {
         liked_uri: String,
     },
@@ -205,7 +247,8 @@ pub async fn read_message<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientMessage, Event, Incoming, PlayerUpdate, Request, ServerMessage, mismatch, parse,
+        ClientMessage, Event, Failure, Incoming, Kind, PlayerUpdate, Request, ServerMessage,
+        mismatch, parse,
         read_message, write_message,
     };
     use tokio::io::BufReader;
@@ -254,6 +297,22 @@ mod tests {
         let event = parse::<ServerMessage>(r#"{"Event":{"Player":{"Warp":3}}}"#).expect("json");
         assert!(matches!(event, Incoming::Unknown { id: None, .. }));
         assert!(parse::<ServerMessage>("not json").is_err());
+    }
+
+    #[test]
+    fn failures_cross_the_socket_with_their_kind() {
+        let reply = ServerMessage::Reply {
+            id: 3,
+            result: Err(Failure::new(Kind::RateLimited, "slow down")),
+        };
+        let line = serde_json::to_string(&reply).expect("serializes");
+        let Ok(Incoming::Message(ServerMessage::Reply { id: 3, result: Err(failure) })) =
+            parse(&line)
+        else {
+            panic!("a failure parses back");
+        };
+        assert_eq!(failure.kind, Kind::RateLimited);
+        assert_eq!(failure.to_string(), "slow down");
     }
 
     #[test]

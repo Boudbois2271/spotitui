@@ -2,7 +2,10 @@
 //!
 //! Adapted from fusor-rs/spotify-tui (MIT).
 
-use crate::spotify::{Album, Artist, Playlist, Track};
+use crate::{
+    protocol::Failure,
+    spotify::{Album, Artist, Playlist, Track},
+};
 use std::{ops::Range, rc::Rc};
 
 /// Something the main pane can list.
@@ -20,7 +23,7 @@ pub enum Source {
 pub enum Loading {
     Idle,
     Busy,
-    Failed(String),
+    Failed(Failure),
 }
 
 /// The tracks of a source. Every track URI is known up front; details load as rows come into view.
@@ -146,7 +149,7 @@ impl Listing {
     pub fn summary(&self) -> String {
         match &self.loading {
             Loading::Busy if self.tracks.is_empty() => "Loading…".into(),
-            Loading::Failed(error) => error.clone(),
+            Loading::Failed(error) => error.message.clone(),
             _ if self.uris.len() == 1 => "1 song".into(),
             _ => format!("{} songs", self.uris.len()),
         }

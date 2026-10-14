@@ -30,6 +30,8 @@ pub enum Error {
     Json(#[from] serde_json::Error),
     #[error("Cannot read Spotify's response ({0})")]
     Response(String),
+    #[error("Spotify has no lyrics for this track, and LRCLIB (the fallback) didn't answer ({0})")]
+    Lrclib(reqwest::Error),
     #[error("Your Spotify login expired or was revoked; log in again")]
     Unauthorized,
     #[error("Login failed: {0}")]

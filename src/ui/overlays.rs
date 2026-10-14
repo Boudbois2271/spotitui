@@ -96,7 +96,7 @@ pub fn welcome(frame: &mut Frame, app: &mut App, area: Rect) {
             "Approve spotitui in your browser. This screen continues by itself.".to_owned(),
             Style::new().fg(theme.subtext),
         ),
-        Screen::Failed(error) => (error.clone(), Style::new().fg(theme.error)),
+        Screen::Failed(error) => (error.message.clone(), Style::new().fg(theme.error)),
         Screen::Library => (String::new(), Style::new()),
     };
     for row in wrap(&status, width.into()) {

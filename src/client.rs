@@ -5,8 +5,8 @@
 
 use crate::{
     protocol::{
-        self, ClientMessage, Event, Incoming, Request, Response, ServerMessage, read_line,
-        write_message,
+        self, ClientMessage, Event, Failure, Incoming, Kind, Request, Response, ServerMessage,
+        read_line, write_message,
     },
     spotify::{Lyrics, NowTrack, Playlist, Track},
 };
@@ -34,7 +34,7 @@ pub enum Notification {
     Event(Event),
 }
 
-type Reply = Result<Response, String>;
+type Reply = Result<Response, Failure>;
 
 struct Outgoing {
     request: Request,
@@ -62,28 +62,28 @@ impl Service {
         answer.await.map_err(|_| stopped())?
     }
 
-    pub async fn done(&self, request: Request) -> Result<(), String> {
+    pub async fn done(&self, request: Request) -> Result<(), Failure> {
         match self.request(request).await? {
             Response::Done => Ok(()),
             other => Err(unexpected(&other)),
         }
     }
 
-    pub async fn playlists(&self) -> Result<Vec<Playlist>, String> {
+    pub async fn playlists(&self) -> Result<Vec<Playlist>, Failure> {
         match self.request(Request::Playlists).await? {
             Response::Playlists(playlists) => Ok(playlists),
             other => Err(unexpected(&other)),
         }
     }
 
-    pub async fn uris(&self, request: Request) -> Result<Vec<String>, String> {
+    pub async fn uris(&self, request: Request) -> Result<Vec<String>, Failure> {
         match self.request(request).await? {
             Response::Uris(uris) => Ok(uris),
             other => Err(unexpected(&other)),
         }
     }
 
-    pub async fn tracks(&self, uris: Vec<String>) -> Result<Vec<Track>, String> {
+    pub async fn tracks(&self, uris: Vec<String>) -> Result<Vec<Track>, Failure> {
         match self.request(Request::Tracks(uris)).await? {
             Response::Tracks(tracks) => Ok(tracks),
             other => Err(unexpected(&other)),
@@ -91,14 +91,14 @@ impl Service {
     }
 
     /// Saves a track to Liked Songs; false when it was already there.
-    pub async fn like(&self, uri: String) -> Result<bool, String> {
+    pub async fn like(&self, uri: String) -> Result<bool, Failure> {
         match self.request(Request::Like(uri)).await? {
             Response::Liked { added } => Ok(added),
             other => Err(unexpected(&other)),
         }
     }
 
-    pub async fn lyrics(&self, track: NowTrack) -> Result<Option<Lyrics>, String> {
+    pub async fn lyrics(&self, track: NowTrack) -> Result<Option<Lyrics>, Failure> {
         match self.request(Request::Lyrics(track)).await? {
             Response::Lyrics(lyrics) => Ok(lyrics),
             other => Err(unexpected(&other)),
@@ -106,20 +106,29 @@ impl Service {
     }
 }
 
-fn stopped() -> String {
-    "The spotitui service stopped; reconnecting…".into()
+fn stopped() -> Failure {
+    Failure::new(
+        Kind::ServiceDown,
+        "The spotitui service stopped; reconnecting…",
+    )
 }
 
-fn not_running() -> String {
-    "The spotitui service isn't running yet".into()
+fn not_running() -> Failure {
+    Failure::new(Kind::ServiceDown, "The spotitui service isn't running yet")
 }
 
-fn unreadable() -> String {
-    "The spotitui service answered in a newer format; restart this window".into()
+fn unreadable() -> Failure {
+    Failure::new(
+        Kind::Unsupported,
+        "The spotitui service answered in a newer format; restart this window",
+    )
 }
 
-fn unexpected(response: &Response) -> String {
-    format!("The spotitui service answered unexpectedly ({response:?})")
+fn unexpected(response: &Response) -> Failure {
+    Failure::new(
+        Kind::Other,
+        format!("The spotitui service answered unexpectedly ({response:?})"),
+    )
 }
 
 /// Keeps a connection to the service for as long as the window lives.
@@ -128,9 +137,7 @@ async fn maintain(
     notify: impl Fn(Notification) + Send + Sync + 'static,
 ) {
     let Some(path) = protocol::socket_path() else {
-        notify(Notification::Disconnected(
-            "XDG_RUNTIME_DIR is not set".into(),
-        ));
+        notify(Notification::Disconnected("XDG_RUNTIME_DIR is not set".into()));
         return;
     };
     let mut started = false;
@@ -143,7 +150,7 @@ async fn maintain(
                 if !session(stream, &mut queue, &notify).await {
                     return;
                 }
-                notify(Notification::Disconnected(stopped()));
+                notify(Notification::Disconnected(stopped().message));
             }
             Err(_) => {
                 if !started {

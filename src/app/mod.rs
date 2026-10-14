@@ -9,7 +9,7 @@ pub mod playback;
 
 use crate::{
     client::{Notification, Service},
-    protocol::{self, Event, PlayerUpdate, Request, Snapshot, Status},
+    protocol::{self, Event, Failure, Kind, PlayerUpdate, Request, Snapshot, Status},
     spotify::{self, Authorization, Command, Lyrics, Mode, Play, Playlist, Track},
     theme::{Theme, ThemeSource},
 };
@@ -39,7 +39,7 @@ pub enum Screen {
     Connecting,
     LoggedOut,
     Waiting(String),
-    Failed(String),
+    Failed(Failure),
     Library,
 }
 
@@ -61,7 +61,7 @@ pub enum LyricsStatus {
     Loading,
     Ready(Rc<Lyrics>),
     Missing,
-    Failed(String),
+    Failed(Failure),
 }
 
 /// Lyrics of one track.
@@ -118,19 +118,19 @@ pub enum Msg {
     Service(Notification),
     /// The browser login finished and the service was told to use it.
     LoggedIn,
-    LoginFailed(String),
-    Playlists(Result<Vec<Playlist>, String>),
+    LoginFailed(Failure),
+    Playlists(Result<Vec<Playlist>, Failure>),
     Uris {
         generation: u64,
-        result: Result<Vec<String>, String>,
+        result: Result<Vec<String>, Failure>,
     },
     Tracks {
         generation: u64,
-        result: Result<Vec<Track>, String>,
+        result: Result<Vec<Track>, Failure>,
     },
     Lyrics {
         uri: String,
-        result: Result<Option<Lyrics>, String>,
+        result: Result<Option<Lyrics>, Failure>,
     },
     Notice {
         text: String,
@@ -239,12 +239,10 @@ impl App {
         let (http, tx, service) = (self.http.clone(), self.tx.clone(), self.service.clone());
         let page = callback_page(&self.theme);
         tokio::spawn(async move {
+            let local = |error: spotify::Error| Failure::new(Kind::Other, error.to_string());
             let result = async {
-                let token = authorization
-                    .complete(&http, &page)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                token.store().map_err(|error| error.to_string())?;
+                let token = authorization.complete(&http, &page).await.map_err(local)?;
+                token.store().map_err(local)?;
                 // The service reads the login from the keyring.
                 service.done(Request::Reconnect).await
             }
@@ -352,7 +350,7 @@ impl App {
             Status::Connecting if in_library => self.inform("Reconnecting to Spotify…"),
             Status::Connecting if !waiting => self.screen = Screen::Connecting,
             Status::LoggedOut if !waiting => self.screen = Screen::LoggedOut,
-            Status::Failed(error) if in_library => self.warn(error),
+            Status::Failed(error) if in_library => self.warn(error.message),
             Status::Failed(error) if !waiting => self.screen = Screen::Failed(error),
             // A browser login in progress keeps its screen.
             Status::Connecting | Status::LoggedOut | Status::Failed(_) => {}
@@ -713,7 +711,7 @@ impl App {
                     error: false,
                 },
                 Err(error) => Msg::Notice {
-                    text: error,
+                    text: error.message,
                     error: true,
                 },
             };
@@ -740,7 +738,7 @@ impl App {
                     error: false,
                 },
                 Err(error) => Msg::Notice {
-                    text: error,
+                    text: error.message,
                     error: true,
                 },
             };
@@ -754,8 +752,11 @@ impl App {
     fn send(&self, request: Request) {
         let (tx, service) = (self.tx.clone(), self.service.clone());
         tokio::spawn(async move {
-            if let Err(text) = service.done(request).await {
-                let _ = tx.send(Msg::Notice { text, error: true });
+            if let Err(failure) = service.done(request).await {
+                let _ = tx.send(Msg::Notice {
+                    text: failure.message,
+                    error: true,
+                });
             }
         });
     }
@@ -874,7 +875,7 @@ impl App {
         });
     }
 
-    fn lyrics_arrived(&mut self, uri: String, result: Result<Option<Lyrics>, String>) {
+    fn lyrics_arrived(&mut self, uri: String, result: Result<Option<Lyrics>, Failure>) {
         let status = match result {
             Ok(Some(lyrics)) => LyricsStatus::Ready(Rc::new(lyrics)),
             Ok(None) => LyricsStatus::Missing,
@@ -959,12 +960,15 @@ impl Target {
         }
     }
 
-    async fn resolve(self, service: &Service) -> Result<Vec<String>, String> {
+    async fn resolve(self, service: &Service) -> Result<Vec<String>, Failure> {
         match self {
             Self::Nothing => Ok(Vec::new()),
             Self::Recent => service.uris(Request::RecentTracks).await,
             Self::Context(uri) => service.uris(Request::ContextTracks(uri)).await,
-            Self::Unknown => Err("Not connected to Spotify yet".into()),
+            Self::Unknown => Err(Failure::new(
+                Kind::NotConnected,
+                "Not connected to Spotify yet",
+            )),
         }
     }
 }

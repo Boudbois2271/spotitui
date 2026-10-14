@@ -47,7 +47,10 @@ impl Lyrics {
                 Err(error) => log::info!("Spotify lyrics failed, trying LRCLIB: {error}"),
             }
         }
-        lrclib(&http, &track).await
+        lrclib(&http, &track).await.map_err(|error| match error {
+            Error::Network(error) => Error::Lrclib(error),
+            other => other,
+        })
     }
 }
 
@@ -84,7 +87,9 @@ async fn spotify(session: Session, id: String) -> Result<Option<Lyrics>, Error> 
     {
         Ok(body) => body,
         // Spotify answers 404 for tracks without lyrics.
-        Err(error) if error.to_string().contains("404") => return Ok(None),
+        Err(error) if error.kind == librespot_core::error::ErrorKind::NotFound => {
+            return Ok(None);
+        }
         Err(error) => return Err(error.into()),
     };
     if body.is_empty() {
