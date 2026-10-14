@@ -298,8 +298,12 @@ pub fn finder(frame: &mut Frame, app: &mut App, area: Rect) {
     let progress = app.finder_progress();
     let source = app.listing.source.title();
     let total = app.listing.uris.len();
-    let tracks = app.listing.tracks.clone();
-    let Some(finder) = app.finder.as_mut() else {
+    // Borrowed side by side: the finder changes, the list's tracks are only read.
+    let App {
+        finder, listing, ..
+    } = app;
+    let tracks = &listing.tracks;
+    let Some(finder) = finder.as_mut() else {
         return;
     };
     let width = 76.min(area.width);

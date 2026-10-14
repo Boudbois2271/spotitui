@@ -12,7 +12,7 @@ use crossterm::{
     cursor::Show,
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        EventStream,
+        Event, EventStream, MouseEvent, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -93,7 +93,8 @@ fn dispatch() -> Result<()> {
 
 fn run() -> Result<()> {
     logger::init();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
+    // One thread is plenty for a window that mostly waits.
+    let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
     let result = runtime.block_on(play());
@@ -135,14 +136,23 @@ async fn play() -> Result<()> {
     let mut terminate = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
 
+    let mut redraw = true;
     loop {
-        if let Err(error) = terminal.draw(|frame| ui::draw(frame, &mut app)) {
-            break Err(error.into());
+        if redraw {
+            if let Err(error) = terminal.draw(|frame| ui::draw(frame, &mut app)) {
+                break Err(error.into());
+            }
+            // The frame measured the list; load the rows it can now show.
+            app.load_more();
         }
-        // The frame measured the list; load the rows it can now show.
-        app.load_more();
+        redraw = true;
         tokio::select! {
             event = events.next() => match event {
+                // The terminal reports every mouse movement; nothing reacts to them.
+                Some(Ok(Event::Mouse(MouseEvent {
+                    kind: MouseEventKind::Moved,
+                    ..
+                }))) => redraw = false,
                 Some(Ok(event)) => app.input(&event),
                 Some(Err(error)) => break Err(error.into()),
                 None => break Ok(()),

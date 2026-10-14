@@ -4,6 +4,7 @@
 
 use super::{App, Focus, View, listing::Step, listing::Window};
 use crate::spotify::Track;
+use std::rc::Rc;
 
 pub struct Finder {
     pub query: String,
@@ -12,6 +13,9 @@ pub struct Finder {
     /// Indices into the list's loaded tracks, in list order.
     pub matches: Vec<usize>,
     pub window: Window,
+    /// Each loaded track with its lowercase "title artists album", made once
+    /// rather than on every key; in step with the list's tracks.
+    searchable: Vec<(Rc<Track>, String)>,
 }
 
 impl Finder {
@@ -21,20 +25,27 @@ impl Finder {
     }
 }
 
-/// Whether every word of the query appears in the title, artists or album,
-/// ignoring case. An empty query matches everything.
-pub fn matches(track: &Track, query: &str) -> bool {
-    let haystack = format!(
+/// What a query is matched against: title, artists and album, lowercase.
+fn searchable(track: &Track) -> String {
+    format!(
         "{} {} {}",
         track.name,
         track.artist_names(),
         track.album.name
     )
-    .to_lowercase();
-    query
-        .to_lowercase()
-        .split_whitespace()
-        .all(|word| haystack.contains(word))
+    .to_lowercase()
+}
+
+/// Whether every word of the query appears in the title, artists or album,
+/// ignoring case. An empty query matches everything.
+#[cfg(test)]
+pub fn matches(track: &Track, query: &str) -> bool {
+    let words: Vec<String> = query.split_whitespace().map(str::to_lowercase).collect();
+    has_all(&searchable(track), &words)
+}
+
+fn has_all(haystack: &str, words: &[String]) -> bool {
+    words.iter().all(|word| haystack.contains(word.as_str()))
 }
 
 impl App {
@@ -50,6 +61,7 @@ impl App {
             typing: true,
             matches: Vec::new(),
             window: Window::default(),
+            searchable: Vec::new(),
         });
         self.refilter();
         // Every row must be loaded to be found; the rest loads in the background.
@@ -66,12 +78,33 @@ impl App {
             return;
         };
         let keep = finder.current();
-        finder.matches = self
-            .listing
-            .tracks
+        let tracks = &self.listing.tracks;
+        // Rows only append while the finder is open, unless a saved track went first.
+        let shifted = finder.searchable.len() > tracks.len()
+            || finder
+                .searchable
+                .iter()
+                .zip(tracks)
+                .any(|((known, _), track)| !Rc::ptr_eq(known, track));
+        if shifted {
+            finder.searchable.clear();
+        }
+        let known = finder.searchable.len();
+        finder.searchable.extend(
+            tracks[known..]
+                .iter()
+                .map(|track| (track.clone(), searchable(track))),
+        );
+        let words: Vec<String> = finder
+            .query
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        finder.matches = finder
+            .searchable
             .iter()
             .enumerate()
-            .filter(|(_, track)| matches(track, &finder.query))
+            .filter(|(_, (_, haystack))| has_all(haystack, &words))
             .map(|(index, _)| index)
             .collect();
         let at = keep
