@@ -24,6 +24,11 @@ const SCOPES: &str = "streaming user-read-private playlist-read-private \
 const VERIFIER_LENGTH: usize = 64;
 const STATE_LENGTH: usize = 16;
 const MAX_REQUEST_BYTES: usize = 8192;
+/// How long a browser connection may take to send its request. Browsers open
+/// connections ahead of time that may never carry one.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long the login waits for the browser before giving up the port.
+const LOGIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 
 pub struct Authorization {
     pub url: String,
@@ -73,15 +78,14 @@ impl Authorization {
         let listener = TcpListener::bind(CALLBACK_ADDRESS).await.map_err(|error| {
             Error::Callback(format!("cannot listen on {CALLBACK_ADDRESS}: {error}"))
         })?;
-        let code = loop {
-            let (mut stream, _) = listener.accept().await?;
-            let Some(callback) = read_callback(&mut stream).await? else {
-                stream.write_all(NOT_FOUND).await?;
-                continue;
-            };
-            respond(&mut stream, page).await?;
-            break self.code(&callback)?;
-        };
+        let callback = tokio::time::timeout(LOGIN_TIMEOUT, wait_for_callback(&listener))
+            .await
+            .map_err(|_| {
+                Error::Callback("the browser didn't come back in 10 minutes; try again".into())
+            })??;
+        let (mut stream, callback) = callback;
+        respond(&mut stream, page).await?;
+        let code = self.code(&callback)?;
         let redirect = redirect_uri();
         Token::request(
             http,
@@ -204,6 +208,33 @@ fn random_text(length: usize) -> String {
 const NOT_FOUND: &[u8] =
     b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
 
+/// Accepts browser connections until one brings the login callback. Each is read
+/// on its own, with a time limit, so an idle one can't hold up the rest.
+async fn wait_for_callback(listener: &TcpListener) -> Result<(TcpStream, Url), Error> {
+    let mut reading = tokio::task::JoinSet::new();
+    loop {
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (mut stream, _) = accepted?;
+                reading.spawn(async move {
+                    let callback = tokio::time::timeout(REQUEST_TIMEOUT, read_callback(&mut stream))
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .flatten();
+                    (stream, callback)
+                });
+            }
+            Some(Ok((mut stream, callback))) = reading.join_next() => match callback {
+                Some(callback) => return Ok((stream, callback)),
+                None => {
+                    let _ = stream.write_all(NOT_FOUND).await;
+                }
+            },
+        }
+    }
+}
+
 /// Returns the callback URL, or `None` for unrelated requests such as a favicon.
 async fn read_callback(stream: &mut TcpStream) -> Result<Option<Url>, Error> {
     let mut request = Vec::new();
@@ -241,8 +272,42 @@ async fn respond(stream: &mut TcpStream, page: &str) -> Result<(), Error> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Error, refusal};
+    use super::{Error, refusal, wait_for_callback};
     use reqwest::StatusCode;
+    use std::time::{Duration, Instant};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+    };
+
+    #[tokio::test]
+    async fn an_idle_browser_connection_doesnt_hold_up_the_login() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("binds");
+        let address = listener.local_addr().expect("an address");
+        let started = Instant::now();
+        let browser = async {
+            // A connection opened ahead of time that never sends anything.
+            let _idle = TcpStream::connect(address).await.expect("connects");
+            let mut favicon = TcpStream::connect(address).await.expect("connects");
+            favicon
+                .write_all(b"GET /favicon.ico HTTP/1.1\r\n\r\n")
+                .await
+                .expect("writes");
+            let mut answer = Vec::new();
+            favicon.read_to_end(&mut answer).await.expect("reads");
+            assert!(answer.starts_with(b"HTTP/1.1 404"));
+            let mut login = TcpStream::connect(address).await.expect("connects");
+            login
+                .write_all(b"GET /login?code=c&state=s HTTP/1.1\r\n\r\n")
+                .await
+                .expect("writes");
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        };
+        let (found, ()) = tokio::join!(wait_for_callback(&listener), browser);
+        let (_, url) = found.expect("the callback");
+        assert_eq!(url.query(), Some("code=c&state=s"));
+        assert!(started.elapsed() < Duration::from_secs(5), "not held up by the idle one");
+    }
 
     #[test]
     fn only_a_refused_login_needs_the_user() {
