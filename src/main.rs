@@ -108,7 +108,7 @@ async fn play() -> Result<()> {
     };
     let mut app = App::new(
         tx,
-        reqwest::Client::new(),
+        spotify::http(),
         theme::ThemeSource::new(),
         service,
     );

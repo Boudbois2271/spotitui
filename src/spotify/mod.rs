@@ -18,6 +18,42 @@ pub use lyrics::Lyrics;
 pub use model::{Album, Artist, NowTrack, Playlist, Repeat, Track};
 pub use speaker::{Command, Connection, DEVICE_NAME, Mode, Play, Speaker, now_track};
 
+use std::time::Duration;
+
+/// How long a plain HTTP request may take to connect, and in all.
+const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const HTTP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The HTTP client for everything outside librespot (login, LRCLIB, covers).
+/// Without timeouts a request on a half-dead connection, as after waking from
+/// sleep, could wait forever.
+pub fn http() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(HTTP_CONNECT_TIMEOUT)
+        .timeout(HTTP_TIMEOUT)
+        .build()
+        // Only a broken TLS setup fails here; a client without timeouts still works.
+        .unwrap_or_default()
+}
+
+/// Runs `task` on the runtime's workers, giving up (and stopping it) after
+/// `limit`. librespot's own HTTP requests have no timeout.
+pub(crate) async fn bounded<T: Send + 'static>(
+    limit: Duration,
+    what: &'static str,
+    task: impl Future<Output = Result<T, Error>> + Send + 'static,
+) -> Result<T, Error> {
+    let handle = tokio::spawn(task);
+    let abort = handle.abort_handle();
+    match tokio::time::timeout(limit, handle).await {
+        Ok(joined) => joined?,
+        Err(_) => {
+            abort.abort();
+            Err(Error::Timeout(what))
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("Cannot reach Spotify; check your network connection ({0})")]
@@ -42,6 +78,37 @@ pub enum Error {
     Keyring(#[from] keyring::Error),
     #[error("No audio output is available on this computer")]
     NoAudio,
+    #[error("Spotify didn't answer in time ({0})")]
+    Timeout(&'static str),
     #[error("A Spotify request stopped unexpectedly ({0})")]
     Stopped(#[from] tokio::task::JoinError),
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, bounded};
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+        time::Duration,
+    };
+
+    #[tokio::test]
+    async fn slow_requests_give_up_and_stop() {
+        let finished = Arc::new(AtomicBool::new(false));
+        let flag = finished.clone();
+        let result = bounded(Duration::from_millis(50), "a test", async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            flag.store(true, Ordering::SeqCst);
+            Ok(())
+        })
+        .await;
+        assert!(matches!(result, Err(Error::Timeout("a test"))));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!finished.load(Ordering::SeqCst), "the task was stopped");
+        let quick = bounded(Duration::from_secs(1), "a test", async { Ok(7) }).await;
+        assert!(matches!(quick, Ok(7)));
+    }
 }

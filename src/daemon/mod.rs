@@ -106,7 +106,7 @@ impl Daemon {
             events: broadcast::channel(EVENT_BACKLOG).0,
             reconnect: Notify::new(),
             slot,
-            http: reqwest::Client::new(),
+            http: spotify::http(),
         }
     }
 
@@ -355,7 +355,9 @@ fn failure(error: &spotify::Error) -> Failure {
         spotify::Error::Network(error) if error.status().is_some_and(|s| s.as_u16() == 429) => {
             Kind::RateLimited
         }
-        spotify::Error::Network(_) | spotify::Error::Lrclib(_) => Kind::Network,
+        spotify::Error::Network(_) | spotify::Error::Lrclib(_) | spotify::Error::Timeout(_) => {
+            Kind::Network
+        }
         spotify::Error::Librespot(error) => match error.kind {
             ErrorKind::ResourceExhausted => Kind::RateLimited,
             ErrorKind::NotFound => Kind::NotFound,

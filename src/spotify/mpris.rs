@@ -66,7 +66,7 @@ pub async fn serve(slot: SpircSlot) -> zbus::Result<Mpris> {
         .await?;
     Ok(Mpris {
         player,
-        http: reqwest::Client::new(),
+        http: super::http(),
         _connection: connection,
     })
 }

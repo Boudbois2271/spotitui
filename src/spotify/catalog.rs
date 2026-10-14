@@ -180,11 +180,15 @@ pub fn search_uri(text: &str) -> String {
     uri
 }
 
-/// librespot's requests are `Send`; they run on the Tokio runtime's workers.
+/// Generous: resolving a long list follows many pages.
+const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// librespot's requests are `Send`; they run on the Tokio runtime's workers,
+/// with a time limit.
 pub(super) async fn run<T: Send + 'static>(
     task: impl Future<Output = Result<T, Error>> + Send + 'static,
 ) -> Result<T, Error> {
-    tokio::spawn(task).await?
+    super::bounded(REQUEST_TIMEOUT, "a library request", task).await
 }
 
 async fn fetch_page(session: &Session, url: &str) -> Result<ContextPage, Error> {

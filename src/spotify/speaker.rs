@@ -2,7 +2,7 @@
 //!
 //! Adapted from fusor-rs/spotify-tui (MIT).
 
-use super::{Catalog, Error, NowTrack, Repeat};
+use super::{Catalog, Error, NowTrack, Repeat, bounded, catalog::run};
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use librespot_connect::{
     ConnectConfig, LoadContextOptions, LoadRequest, LoadRequestOptions, Options, PlayingTrack,
@@ -22,6 +22,8 @@ use std::sync::{Arc, Mutex};
 
 /// The name this computer shows in every Spotify Connect device list.
 pub const DEVICE_NAME: &str = "spotitui";
+/// Logging in and registering the speaker; librespot's own login has a shorter one.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
 /// PulseAudio (PipeWire on Omarchy) names the stream in volume mixers; rodio/ALSA is the fallback.
 const PREFERRED_BACKEND: &str = "pulseaudio";
 
@@ -126,7 +128,12 @@ pub enum Command {
 impl Speaker {
     /// Logs in and registers the speaker. Must run inside the Tokio runtime.
     pub async fn connect(access_token: String, initial_volume: u16) -> Result<Connection, Error> {
-        tokio::spawn(start(access_token, initial_volume)).await?
+        bounded(
+            CONNECT_TIMEOUT,
+            "logging in",
+            start(access_token, initial_volume),
+        )
+        .await
     }
 
     pub fn play(&self, play: Play, mode: Mode) -> Result<(), Error> {
@@ -182,13 +189,13 @@ impl Speaker {
         queue: Option<super::queue::LiveQueue>,
     ) -> impl Future<Output = Result<(), Error>> + Send + 'static {
         let session = self.session.clone();
-        async move { tokio::spawn(play_next(session, track, queue)).await? }
+        async move { run(play_next(session, track, queue)).await }
     }
 
     /// Adds a track after the playing one and any tracks queued before it.
     pub fn queue(&self, track: String) -> impl Future<Output = Result<(), Error>> + Send + 'static {
         let session = self.session.clone();
-        async move { tokio::spawn(add_to_queue(session, track)).await? }
+        async move { run(add_to_queue(session, track)).await }
     }
 }
 
