@@ -2,7 +2,8 @@
 //! `cargo test live_ -- --ignored --nocapture --test-threads=1`. They log in a
 //! plain session (no speaker), so a running spotitui service isn't disturbed.
 
-use super::{Catalog, Token, stored_refresh_token};
+use super::{Catalog, Token, queue, stored_refresh_token};
+use futures_util::StreamExt;
 use librespot_core::{Session, SessionConfig, authentication::Credentials};
 use librespot_protocol::playlist4_external::SelectedListContent;
 use protobuf::Message;
@@ -163,5 +164,67 @@ async fn live_undo() {
             .await
             .expect("remove");
         println!("removed {track} from {playlist}");
+    }
+}
+
+/// Prints Spotify's device list as a hidden observer sees it: which device is
+/// active and whether it plays. Shows whether a stopped service left the list.
+#[tokio::test]
+#[ignore = "talks to Spotify"]
+async fn live_cluster() {
+    let refresh = stored_refresh_token()
+        .expect("keyring readable")
+        .expect("logged in");
+    let token = Token::refresh(&reqwest::Client::new(), &refresh)
+        .await
+        .expect("token refreshes");
+    token.store().expect("token stored");
+    let config = SessionConfig {
+        device_id: queue::observer_id(),
+        ..SessionConfig::default()
+    };
+    let session = Session::new(config, None);
+    let mut connections = session
+        .dealer()
+        .listen_for("hm://pusher/v1/connections/", |message| {
+            message
+                .headers
+                .get("Spotify-Connection-Id")
+                .cloned()
+                .ok_or_else(|| librespot_core::Error::not_found("no connection id"))
+        })
+        .expect("subscribes");
+    session
+        .connect(Credentials::with_access_token(token.access), false)
+        .await
+        .expect("session connects");
+    session.dealer().start().await.expect("dealer starts");
+    let id = connections
+        .next()
+        .await
+        .expect("a connection")
+        .expect("an id");
+    session.set_connection_id(&id);
+    let reply = session
+        .spclient()
+        .put_connect_state_request(&queue::observer(&session))
+        .await
+        .expect("registers");
+    let cluster =
+        librespot_protocol::connect::Cluster::parse_from_bytes(&reply).expect("a cluster");
+    let state = cluster.player_state.as_ref();
+    println!(
+        "active: {:?} playing: {} paused: {}",
+        cluster.active_device_id,
+        state.is_some_and(|state| state.is_playing),
+        state.is_some_and(|state| state.is_paused)
+    );
+    for (id, device) in &cluster.device {
+        println!(
+            "device {} {:?} hidden={}",
+            id,
+            device.name,
+            device.capabilities.as_ref().is_some_and(|caps| caps.hidden)
+        );
     }
 }

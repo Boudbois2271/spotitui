@@ -141,7 +141,7 @@ async fn run_observer(
 }
 
 /// Registers as a hidden device that can neither play nor be chosen.
-fn observer(session: &Session) -> PutStateRequest {
+pub(super) fn observer(session: &Session) -> PutStateRequest {
     PutStateRequest {
         member_type: EnumOrUnknown::new(MemberType::CONNECT_STATE),
         put_state_reason: EnumOrUnknown::new(PutStateReason::NEW_DEVICE),
@@ -171,7 +171,7 @@ fn observer(session: &Session) -> PutStateRequest {
 }
 
 /// Web player observers are named "hobs_" and a random hex id.
-fn observer_id() -> String {
+pub(super) fn observer_id() -> String {
     let bytes: [u8; 16] = rand::rng().random();
     let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
     format!("hobs_{hex}")

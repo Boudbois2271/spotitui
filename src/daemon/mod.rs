@@ -15,7 +15,10 @@ use crate::{
 use librespot_playback::player::PlayerEvent;
 use state::{Live, State};
 use std::{
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{
+        Arc, Mutex, MutexGuard,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -34,6 +37,10 @@ const BACKOFF: [Duration; 5] = [
 /// A pause after a session ends, before connecting again.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
 const EVENT_BACKLOG: usize = 256;
+/// How long the speaker gets to tell Spotify it is leaving.
+const GOODBYE_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long stopping waits for the session to wind down, goodbye included.
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -70,21 +77,40 @@ async fn serve() -> Result<()> {
     };
     let daemon = Arc::new(Daemon::new(slot));
     log::info!("spotitui service listening on {}", path.display());
-    tokio::spawn(supervise(daemon.clone(), mpris));
-    tokio::spawn(server::accept(daemon.clone(), listener));
+    let mut supervisor = tokio::spawn(supervise(daemon.clone(), mpris));
+    let mut acceptor = tokio::spawn(server::accept(daemon.clone(), listener));
 
     let mut terminate = signal(SignalKind::terminate())?;
     let mut interrupt = signal(SignalKind::interrupt())?;
     // A hangup only happens when started from a terminal that closed.
     let mut hangup = signal(SignalKind::hangup())?;
-    tokio::select! {
-        _ = terminate.recv() => {}
-        _ = interrupt.recv() => {}
-        _ = hangup.recv() => {}
+    // Both tasks run for the service's whole life. One that ends has crashed;
+    // exiting with an error lets systemd start a fresh service.
+    let crashed = tokio::select! {
+        _ = terminate.recv() => None,
+        _ = interrupt.recv() => None,
+        _ = hangup.recv() => None,
+        result = &mut supervisor => Some(("the Spotify session keeper", result)),
+        result = &mut acceptor => Some(("the window listener", result)),
+    };
+    if let Some((task, result)) = crashed {
+        let reason = match result {
+            Err(error) if error.is_panic() => "panicked",
+            _ => "stopped",
+        };
+        log::error!("{task} {reason}; exiting so the service restarts");
+        queue::clear();
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("{task} {reason}").into());
     }
     log::info!("spotitui service stopping");
-    // Dropping the speaker tells Spotify this device is leaving.
-    drop(daemon.state().disconnect());
+    acceptor.abort();
+    // The session ends as for a reconnect, so the speaker tells Spotify it's leaving.
+    daemon.stopping.store(true, Ordering::SeqCst);
+    daemon.reconnect.notify_one();
+    if tokio::time::timeout(STOP_TIMEOUT, supervisor).await.is_err() {
+        log::warn!("the session didn't end in time");
+    }
     queue::clear();
     let _ = std::fs::remove_file(&path);
     Ok(())
@@ -95,6 +121,8 @@ pub struct Daemon {
     events: broadcast::Sender<Event>,
     /// Ends the current session (or a wait for one) to read the login again.
     reconnect: Notify,
+    /// Set when the service stops: the session ends and no new one starts.
+    stopping: AtomicBool,
     slot: SpircSlot,
     http: reqwest::Client,
 }
@@ -105,6 +133,7 @@ impl Daemon {
             state: Mutex::new(State::new()),
             events: broadcast::channel(EVENT_BACKLOG).0,
             reconnect: Notify::new(),
+            stopping: AtomicBool::new(false),
             slot,
             http: spotify::http(),
         }
@@ -375,7 +404,7 @@ fn failure(error: &spotify::Error) -> Failure {
 /// stored login, reconnects after the session ends, and waits while logged out.
 async fn supervise(daemon: Arc<Daemon>, mpris: Option<Arc<Mpris>>) {
     let mut failures = 0;
-    loop {
+    while !daemon.stopping.load(Ordering::SeqCst) {
         let refresh_token = match spotify::stored_refresh_token() {
             Ok(Some(token)) => token,
             Ok(None) => {
@@ -395,6 +424,9 @@ async fn supervise(daemon: Arc<Daemon>, mpris: Option<Arc<Mpris>>) {
             Ok(connection) => {
                 failures = 0;
                 run_session(&daemon, connection, mpris.as_deref()).await;
+                if daemon.stopping.load(Ordering::SeqCst) {
+                    return;
+                }
                 tokio::time::sleep(RECONNECT_DELAY).await;
             }
             Err(error) => {
@@ -459,24 +491,36 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
         }
     });
 
-    loop {
+    let session_ended = loop {
         tokio::select! {
             event = events.recv() => match event {
                 Some(event) => daemon.on_player_event(event, mpris).await,
-                None => break,
+                None => break false,
             },
             _ = &mut ended => {
                 log::info!("the Spotify session ended");
-                break;
+                break true;
             }
-            () = daemon.reconnect.notified() => break,
+            () = daemon.reconnect.notified() => break false,
         }
-    }
+    };
 
     observer.abort();
     set_slot(&daemon.slot, None);
-    // Dropping the speaker shuts its Spirc down.
-    drop(daemon.state().disconnect());
+    let live = daemon.state().disconnect();
+    if let Some(live) = &live {
+        // Shut down explicitly: a request still holding the speaker would keep it alive.
+        let _ = live.speaker.spirc().shutdown();
+    }
+    drop(live);
+    // Spirc pauses, marks this device inactive and removes it from Spotify's
+    // device list before its task ends; give it the time to.
+    if !session_ended {
+        match tokio::time::timeout(GOODBYE_TIMEOUT, ended).await {
+            Ok(_) => log::info!("the speaker left Spotify"),
+            Err(_) => log::warn!("the speaker didn't leave Spotify in time"),
+        }
+    }
     queue::clear();
     if let Some(mpris) = mpris {
         mpris.reset().await;
