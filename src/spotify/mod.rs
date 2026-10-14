@@ -99,6 +99,9 @@ pub enum Error {
     Accounts(u16),
     #[error("No audio output is available on this computer")]
     NoAudio,
+    /// The play queue observer's own trouble, said as is.
+    #[error("{0}")]
+    Observer(String),
     #[error("Spotify didn't answer in time ({0})")]
     Timeout(&'static str),
     #[error("A Spotify request stopped unexpectedly ({0})")]

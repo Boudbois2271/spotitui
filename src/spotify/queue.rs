@@ -11,6 +11,7 @@ use futures_util::StreamExt;
 use librespot_core::{
     Session, SessionConfig, authentication::Credentials, dealer::protocol::Message,
 };
+use librespot_protocol::authentication::AuthenticationType;
 use librespot_protocol::{
     connect::{
         Capabilities, Cluster, ClusterUpdate, Device, DeviceInfo, MemberType, PutStateReason,
@@ -20,12 +21,32 @@ use librespot_protocol::{
 };
 use protobuf::{EnumOrUnknown, Message as _, MessageField};
 use serde::Serialize;
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::PathBuf,
+    time::{Duration, Instant},
+};
+use tokio::sync::watch;
 
 const CLUSTER_URI: &str = "hm://connect-state/v1/cluster";
 const CONNECTION_URI: &str = "hm://pusher/v1/connections/";
 const PREVIOUS: usize = 1;
 const UPCOMING: usize = 3;
+/// Waits before restarting the observer, growing to the last.
+const BACKOFF: [Duration; 4] = [
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(15),
+    Duration::from_secs(60),
+];
+/// An observer that ran this long without trouble starts over at the shortest wait.
+const HEALTHY_RUN: Duration = Duration::from_secs(300);
+/// How long the observer may take to show a track the speaker started.
+const FOLLOW_TIMEOUT: Duration = Duration::from_secs(15);
+/// How often the observer checks that its session is still alive.
+const CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// For logging in, starting the dealer and registering as an observer.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// A track in the published list.
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -65,28 +86,72 @@ struct Snapshot<'a> {
 
 /// Watches the play queue from a hidden observer session and calls `report`
 /// whenever the tracks around the playing one change, until aborted.
+///
+/// The observer logs in with the main session's reusable credentials, so it
+/// needs no token of its own. It starts over (after a pause) when it fails,
+/// when its session dies, and when the speaker starts a track it doesn't show
+/// within [`FOLLOW_TIMEOUT`]: librespot's dealer gives up reconnecting after
+/// one failed attempt and then stays silent, with no error to notice.
+/// `playing` is the track the speaker plays.
 pub fn observe(
-    access_token: String,
     catalog: Catalog,
-    report: impl Fn(Around) + Send + 'static,
+    playing: watch::Receiver<Option<String>>,
+    report: impl Fn(Around) + Send + Sync + 'static,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(error) = run_observer(access_token, catalog, report).await {
-            log::warn!("cannot follow the play queue: {error}");
+        let mut failures = 0;
+        loop {
+            let started = Instant::now();
+            let result = run_observer(&catalog, playing.clone(), &report).await;
+            if started.elapsed() >= HEALTHY_RUN {
+                failures = 0;
+            }
+            let delay = BACKOFF[failures.min(BACKOFF.len() - 1)];
+            failures += 1;
+            match result {
+                Ok(()) => log::info!("the play queue observer stopped; restarting in {delay:?}"),
+                Err(error) => {
+                    log::warn!("cannot follow the play queue ({error}); retrying in {delay:?}");
+                }
+            }
+            tokio::time::sleep(delay).await;
         }
     })
 }
 
+/// The main session's login, reusable by another session.
+fn reusable_credentials(main: &Session) -> Credentials {
+    Credentials {
+        username: Some(main.username()),
+        auth_type: AuthenticationType::AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS,
+        auth_data: main.auth_data(),
+    }
+}
+
 async fn run_observer(
-    access_token: String,
-    catalog: Catalog,
-    report: impl Fn(Around) + Send + 'static,
+    catalog: &Catalog,
+    mut playing: watch::Receiver<Option<String>>,
+    report: &impl Fn(Around),
 ) -> Result<(), Error> {
     let config = SessionConfig {
         device_id: observer_id(),
         ..SessionConfig::default()
     };
     let session = Session::new(config, None);
+    let result = follow(&session, catalog, &mut playing, report).await;
+    // Leave Spotify's device list and stop the dealer's reconnect loop.
+    let _ = session.spclient().delete_connect_state_request().await;
+    session.dealer().close().await;
+    session.shutdown();
+    result
+}
+
+async fn follow(
+    session: &Session,
+    catalog: &Catalog,
+    playing: &mut watch::Receiver<Option<String>>,
+    report: &impl Fn(Around),
+) -> Result<(), Error> {
     // The dealer only takes subscriptions before it starts.
     let mut connections = session
         .dealer()
@@ -100,20 +165,51 @@ async fn run_observer(
     let mut clusters = session
         .dealer()
         .listen_for(CLUSTER_URI, Message::from_raw::<ClusterUpdate>)?;
-    session
-        .connect(Credentials::with_access_token(access_token), false)
-        .await?;
-    session.dealer().start().await?;
+    let setup = async {
+        session
+            .connect(reusable_credentials(catalog.session()), false)
+            .await?;
+        session.dealer().start().await
+    };
+    tokio::time::timeout(SETUP_TIMEOUT, setup)
+        .await
+        .map_err(|_| Error::Timeout("starting the play queue observer"))??;
 
     let mut names: HashMap<String, (String, String)> = HashMap::new();
     let mut last: Option<Around> = None;
+    // Set while the speaker plays a track this observer hasn't shown yet.
+    let mut behind_since: Option<Instant> = None;
+    let mut check = tokio::time::interval(CHECK_INTERVAL);
     loop {
         let cluster = tokio::select! {
+            _ = check.tick() => {
+                if session.is_invalid() {
+                    return Err(Error::Observer("its session ended".into()));
+                }
+                if behind_since.is_some_and(|since| since.elapsed() >= FOLLOW_TIMEOUT) {
+                    return Err(Error::Observer(format!(
+                        "it fell behind: no update for the playing track in {FOLLOW_TIMEOUT:?}"
+                    )));
+                }
+                continue;
+            }
+            changed = playing.changed() => {
+                if changed.is_err() {
+                    return Ok(());
+                }
+                behind_since = (!shows(last.as_ref(), playing.borrow().as_deref()))
+                    .then(Instant::now);
+                continue;
+            }
             // A new connection (also after a reconnect) needs the observer registered again.
             id = connections.next() => match id {
                 Some(Ok(id)) => {
                     session.set_connection_id(&id);
-                    let reply = session.spclient().put_connect_state_request(&observer(&session)).await?;
+                    let request = observer(session);
+                    let register = session.spclient().put_connect_state_request(&request);
+                    let reply = tokio::time::timeout(SETUP_TIMEOUT, register)
+                        .await
+                        .map_err(|_| Error::Timeout("registering the play queue observer"))??;
                     Cluster::parse_from_bytes(&reply)?
                 }
                 Some(Err(error)) => {
@@ -131,11 +227,24 @@ async fn run_observer(
                 None => return Ok(()),
             },
         };
-        let around = around(&cluster.player_state, &catalog, &mut names).await;
+        let around = around(&cluster.player_state, catalog, &mut names).await;
+        if shows(Some(&around), playing.borrow().as_deref()) {
+            behind_since = None;
+        }
         if last.as_ref() != Some(&around) {
             report(around.clone());
             last = Some(around);
         }
+    }
+}
+
+/// Whether the observer's queue has `uri` as the playing track.
+fn shows(around: Option<&Around>, uri: Option<&str>) -> bool {
+    match uri {
+        None => true,
+        Some(uri) => around
+            .and_then(|around| around.queue.as_ref())
+            .is_some_and(|queue| queue.current_uri == uri),
     }
 }
 
@@ -301,7 +410,7 @@ fn file() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MessageField, ProvidedTrack, neighbors, observer_id};
+    use super::{Around, LiveQueue, MessageField, ProvidedTrack, neighbors, observer_id, shows};
 
     fn track(uri: &str) -> ProvidedTrack {
         ProvidedTrack {
@@ -327,6 +436,25 @@ mod tests {
             .collect();
         assert_eq!(offsets, ["-1b", "0c", "1d", "2e", "3f"]);
         assert!(neighbors(&previous, &MessageField::none(), &next).is_empty());
+    }
+
+    #[test]
+    fn the_observer_is_behind_until_its_queue_shows_the_playing_track() {
+        let around = |current: &str| Around {
+            context_uri: String::new(),
+            context_name: String::new(),
+            tracks: Vec::new(),
+            queue: Some(LiveQueue {
+                current_uri: current.into(),
+                next: Vec::new(),
+                prev: Vec::new(),
+                revision: String::new(),
+            }),
+        };
+        assert!(shows(None, None), "nothing plays, nothing to show");
+        assert!(!shows(None, Some("spotify:track:a")));
+        assert!(!shows(Some(&around("spotify:track:a")), Some("spotify:track:b")));
+        assert!(shows(Some(&around("spotify:track:b")), Some("spotify:track:b")));
     }
 
     #[test]

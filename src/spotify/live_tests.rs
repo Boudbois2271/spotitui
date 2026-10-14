@@ -230,3 +230,27 @@ async fn live_cluster() {
         );
     }
 }
+
+/// A second session can log in with the first one's reusable credentials,
+/// under another device ID, without a fresh token.
+#[tokio::test]
+#[ignore = "talks to Spotify"]
+async fn live_reusable_credentials() {
+    let first = catalog().await.session().clone();
+    let credentials = Credentials {
+        username: Some(first.username()),
+        auth_type:
+            librespot_protocol::authentication::AuthenticationType::AUTHENTICATION_STORED_SPOTIFY_CREDENTIALS,
+        auth_data: first.auth_data(),
+    };
+    let config = SessionConfig {
+        device_id: format!("hobs_{}", super::device_id("live test 2", 32)),
+        ..SessionConfig::default()
+    };
+    let second = Session::new(config, None);
+    second
+        .connect(credentials, false)
+        .await
+        .expect("reusable credentials log in");
+    println!("second session: {} ok", second.username());
+}

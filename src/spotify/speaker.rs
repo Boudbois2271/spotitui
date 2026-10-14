@@ -93,8 +93,6 @@ pub struct Connection {
     pub speaker: Speaker,
     pub events: PlayerEventChannel,
     pub catalog: Catalog,
-    /// For the play-queue observer's own session.
-    pub access_token: String,
     /// Finishes when the session ends, such as after losing the network.
     pub ended: tokio::task::JoinHandle<()>,
 }
@@ -256,7 +254,7 @@ async fn start(access_token: String, initial_volume: u16) -> Result<Connection, 
         initial_volume,
         ..ConnectConfig::default()
     };
-    let credentials = Credentials::with_access_token(access_token.clone());
+    let credentials = Credentials::with_access_token(access_token);
     let (spirc, task) =
         Spirc::new(config, session.clone(), credentials, player, mixer.clone()).await?;
     let ended = tokio::spawn(task);
@@ -270,7 +268,6 @@ async fn start(access_token: String, initial_volume: u16) -> Result<Connection, 
         },
         events,
         catalog,
-        access_token,
         ended,
     })
 }

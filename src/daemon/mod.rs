@@ -23,7 +23,7 @@ use std::{
 };
 use tokio::{
     signal::unix::{SignalKind, signal},
-    sync::{Notify, broadcast},
+    sync::{Notify, broadcast, watch},
 };
 
 /// Waits between attempts to reach Spotify after failures, growing to the last.
@@ -129,6 +129,8 @@ pub struct Daemon {
     reconnect: Notify,
     /// Set when the service stops: the session ends and no new one starts.
     stopping: AtomicBool,
+    /// The track the speaker plays, for the play queue observer's watchdog.
+    playing: watch::Sender<Option<String>>,
     /// A renewed login the keyring wouldn't take yet; saved on the next attempt.
     /// Spotify may stop accepting the old one once it hands out a new one.
     unsaved_login: Mutex<Option<String>>,
@@ -144,6 +146,7 @@ impl Daemon {
             reconnect: Notify::new(),
             stopping: AtomicBool::new(false),
             unsaved_login: Mutex::new(None),
+            playing: watch::Sender::new(None),
             slot,
             http: spotify::http(),
         }
@@ -362,6 +365,9 @@ impl Daemon {
 
     /// Takes a speaker event: updates the state, MPRIS and every window.
     async fn on_player_event(&self, event: PlayerEvent, mpris: Option<&Mpris>) {
+        if let PlayerEvent::TrackChanged { audio_item } = &event {
+            self.playing.send_replace(Some(audio_item.uri.clone()));
+        }
         let (update, resend_volume) = {
             let mut state = self.state();
             let update = state.apply(&event);
@@ -533,7 +539,6 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
         speaker,
         mut events,
         catalog,
-        access_token,
         mut ended,
     } = connection;
     let speaker = Arc::new(speaker);
@@ -542,7 +547,7 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
     set_slot(&daemon.slot, Some(speaker.spirc()));
     let observer = {
         let daemon = daemon.clone();
-        queue::observe(access_token, catalog.clone(), move |around| {
+        queue::observe(catalog.clone(), daemon.playing.subscribe(), move |around| {
             daemon.publish_queue(&around);
         })
     };
@@ -580,6 +585,7 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
     };
 
     observer.abort();
+    daemon.playing.send_replace(None);
     set_slot(&daemon.slot, None);
     let live = daemon.state().disconnect();
     if let Some(live) = &live {
