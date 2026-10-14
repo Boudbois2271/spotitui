@@ -57,6 +57,26 @@ pub(crate) fn device_id(purpose: &str, length: usize) -> String {
         .collect()
 }
 
+/// For each step of closing a session.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Closes a session: stops its dealer, whose reconnect loop otherwise keeps the
+/// session and its connections alive for the life of the process, then leaves
+/// Spotify's device list. The dealer goes first: on a dead connection the
+/// request may hang until the limit, and the dealer stops as soon as its close
+/// starts.
+pub async fn close_session(session: &librespot_core::Session) {
+    if tokio::time::timeout(CLOSE_TIMEOUT, session.dealer().close())
+        .await
+        .is_err()
+    {
+        log::debug!("a dealer didn't close in time");
+    }
+    let leave = session.spclient().delete_connect_state_request();
+    let _ = tokio::time::timeout(CLOSE_TIMEOUT, leave).await;
+    session.shutdown();
+}
+
 /// Runs `task` on the runtime's workers, giving up (and stopping it) after
 /// `limit`. librespot's own HTTP requests have no timeout.
 pub(crate) async fn bounded<T: Send + 'static>(

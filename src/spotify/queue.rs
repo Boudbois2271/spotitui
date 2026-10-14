@@ -47,8 +47,6 @@ const FOLLOW_TIMEOUT: Duration = Duration::from_secs(15);
 const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// For logging in, starting the dealer and registering as an observer.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(45);
-/// For leaving: removing the device and closing the dealer.
-const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long [`Observer::stop`] waits for the cleanup before cutting it short.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -176,16 +174,7 @@ async fn run_observer(
         result = follow(&session, catalog, &mut playing, report) => result,
         _ = stopped.wait_for(|stop| *stop) => Ok(()),
     };
-    // Leave Spotify's device list and stop the dealer's reconnect loop, which
-    // otherwise keeps the session and its connections alive.
-    let cleanup = async {
-        let _ = session.spclient().delete_connect_state_request().await;
-        session.dealer().close().await;
-    };
-    if tokio::time::timeout(CLEANUP_TIMEOUT, cleanup).await.is_err() {
-        log::debug!("the play queue observer's session didn't close in time");
-    }
-    session.shutdown();
+    super::close_session(&session).await;
     result
 }
 

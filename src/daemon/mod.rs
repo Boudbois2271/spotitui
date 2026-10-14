@@ -641,6 +641,9 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
         }
     };
     tokio::join!(observer.stop(), goodbye);
+    // Spirc closes its dealer last, after requests that can hang on a dead
+    // connection; make sure it is closed, or the session stays alive.
+    spotify::close_session(&session).await;
     queue::clear();
     if let Some(mpris) = mpris {
         mpris.refresh().await;
