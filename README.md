@@ -207,7 +207,17 @@ Spotify retires a refresh token once it hands out a new one, and every refresh
 keyring stops working. The service keeps a renewed login in memory if the keyring
 won't take it, and retries saving it every minute and when stopping.
 
-Library browsing and changes use Spotify's internal, undocumented services (the same ones
-the official apps use), so a Spotify-side change can break it until librespot
-catches up. `Cargo.lock` pins versions known to build; librespot 0.8.0 fails
-with newer `vergen` releases.
+`Cargo.lock` pins versions known to build; librespot 0.8.0 fails with newer
+`vergen` releases.
+
+## Limitations
+
+- spotitui logs in as Spotify's own desktop app (librespot's client ID): Spotify
+  streams audio only to its privileged clients, so a client ID of your own can't
+  play. Spotify could restrict that ID at any time, as it could for every
+  librespot-based player.
+- Browsing, Liked Songs, playlists, the play queue and lyrics use Spotify's
+  internal, undocumented services, the ones the official apps use. The public Web
+  API isn't an option: with librespot's shared client ID it answers 429 (rate
+  limited). A change on Spotify's side can break a feature until spotitui or
+  librespot catches up; playback itself goes through librespot.
