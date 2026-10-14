@@ -920,7 +920,6 @@ impl App {
         self.now.set_volume(volume);
     }
 
-    /// Mutes, or unmutes back to the volume from before.
     /// Mutes or unmutes; the volume level stays as it is.
     fn toggle_mute(&mut self) {
         self.now.muted = !self.now.muted;

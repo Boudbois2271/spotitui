@@ -141,7 +141,8 @@ notch) with the wheel.
   published as `file://` URLs (loading https covers crashed the Omarchy shell).
   Beside MPRIS, the same object serves `io.spotitui.Queue.Skip(offset)`: it
   plays the track `offset` places away in the play order (`-1` goes to the
-  previous track even mid-song), which the bar widget's list uses.
+  previous track even mid-song, at most 20 either way), which the bar widget's
+  list uses.
 - **Single instance:** one service per user (a second one exits); any number
   of windows can connect to it.
 - **Lyrics:** Spotify's own (usually Musixmatch, line-synced). When Spotify has
@@ -155,10 +156,19 @@ notch) with the wheel.
   cluster to the device that is playing. **Play next** (`Z`) uses that queue
   too: with tracks already queued, it sends the queue back with the new track
   first (`set_queue`, as the phone app reorders); otherwise it adds to the queue,
-  which already plays next.
+  which already plays next. The observer logs in with the main session's reusable
+  credentials and starts over by itself if it fails or falls behind the speaker.
 - **Library:** `S` writes to Liked Songs through Spotify's collection service,
   `A` adds to playlists through the playlist service (playlist4 changes on the
-  current revision), both as the official apps do.
+  current revision), both as the official apps do. The service reads Liked Songs
+  once per session and keeps it current with the collection's changes, so `S`
+  costs one small request. Playlists load again when you enter the sidebar (at
+  most every 30 s), and a song saved with `S` shows at the top of Liked Songs.
+- **Recovery:** every network request has a time limit; a list that failed to
+  load tries again by itself, and `l` on it retries at once. The service exits
+  with an error if one of its own tasks crashes, so systemd restarts it. When it
+  stops it tells Spotify the device is leaving, and it keeps one device ID per
+  computer, so other apps see the same spotitui across restarts.
 - **Volume** is remembered in `~/.local/state/spotitui/volume`. **Mute** (`m`) is a
   status of its own, kept in `~/.local/state/spotitui/muted`: it silences the output
   without touching the volume, which Spotify Connect and MPRIS keep showing. Volume
@@ -174,7 +184,9 @@ cargo test                      # unit tests
 cargo test live_cluster -- --ignored --nocapture   # Spotify's device list, as it sees it
 cargo test -- --ignored         # plus live tests: an LRCLIB lookup, and library tests
                                 # that like/unlike a track and add/remove one in a playlist
-                                # (they undo what they do; they need a stored login)
+                                # (they undo what they do; they need a stored login).
+                                # live_take_over takes playback from the running service
+                                # with a second, silent speaker (the service then stops).
 cargo build --release && install -Dm755 target/release/spotitui ~/.local/bin/spotitui \
   && systemctl --user restart spotitui.service
 ```
