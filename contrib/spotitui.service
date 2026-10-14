@@ -4,7 +4,7 @@
 #   systemctl --user daemon-reload && systemctl --user enable --now spotitui.service
 [Unit]
 Description=spotitui Spotify player service
-Documentation=file://%h/Work/spotitui/README.md
+Documentation=https://github.com/Boudbois2271/spotitui
 PartOf=graphical-session.target
 After=graphical-session.target pipewire-pulse.service
 

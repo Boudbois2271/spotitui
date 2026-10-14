@@ -5,7 +5,31 @@ theme. Built with [ratatui](https://ratatui.rs) and
 [librespot](https://github.com/librespot-org/librespot); its design and
 Spotify integration follow [fusor-rs/spotify-tui](https://github.com/fusor-rs/spotify-tui).
 
-Needs Spotify Premium.
+## Requirements
+
+- Spotify Premium (librespot can only stream on Premium accounts).
+- Linux with PipeWire or PulseAudio, a Secret Service keyring (gnome-keyring,
+  KeePassXC…) on the session D-Bus, and systemd for the background service.
+- Rust (stable, via [rustup](https://rustup.rs)) to build it, plus
+  `pkg-config`, the ALSA and PulseAudio development files and OpenSSL. On Arch:
+  `sudo pacman -S rustup pkgconf alsa-lib libpulse openssl`, then
+  `rustup default stable`.
+- Optional: [Omarchy](https://omarchy.org) for the theme colors, the bar widget,
+  the keybindings and `spotitui-open`. Everything else works on any Linux
+  desktop; without an Omarchy theme spotitui uses Spotify's own colors.
+
+## Install
+
+```sh
+git clone https://github.com/Boudbois2271/spotitui.git
+cd spotitui
+cargo build --release
+install -Dm755 target/release/spotitui ~/.local/bin/spotitui   # ~/.local/bin must be on PATH
+spotitui                                                        # log in once, in the browser
+```
+
+`spotitui` starts its background service on its own. To have the service (and
+with it media keys) running from login, also install the systemd unit below.
 
 ## Run
 
@@ -34,7 +58,7 @@ systemctl --user daemon-reload
 systemctl --user enable --now spotitui.service
 journalctl --user -u spotitui -f      # its log
 
-install -Dm755 contrib/spotitui-open ~/.local/bin/spotitui-open
+install -Dm755 contrib/spotitui-open ~/.local/bin/spotitui-open          # needs Omarchy
 install -Dm644 contrib/spotitui.desktop ~/.local/share/applications/spotitui.desktop
 ```
 
@@ -53,7 +77,7 @@ default terminal with the app-id `spotitui` (via Omarchy's
 
   ```sh
   cp -r contrib/omarchy/boudbois.spotify ~/.config/omarchy/plugins/
-  omarchy bar put boudbois.spotify --before boudbois.tray   # or another widget id
+  omarchy bar put boudbois.spotify --before omarchy.tray    # any widget id to sit beside
   omarchy restart shell
   ```
 
