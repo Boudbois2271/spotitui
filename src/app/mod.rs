@@ -31,6 +31,8 @@ const NOTICE_TIME: Duration = Duration::from_secs(4);
 const SEEK_STEP: Duration = Duration::from_secs(10);
 /// Ticks between checks of the Omarchy theme file.
 const THEME_POLL_TICKS: u64 = 4;
+/// Playlists load again on entering the sidebar, at most this often.
+const PLAYLISTS_REFRESH: Duration = Duration::from_secs(30);
 /// The fixed sidebar entries before the playlists: Search, Liked Songs, Recently played.
 pub const FIXED_SHELVES: usize = 3;
 
@@ -139,6 +141,8 @@ pub enum Msg {
         text: String,
         error: bool,
     },
+    /// A track was saved to Liked Songs from this window.
+    Liked(Track),
 }
 
 pub struct App {
@@ -153,6 +157,8 @@ pub struct App {
     /// The Liked Songs context, known once the service is connected.
     liked_uri: Option<String>,
     pub playlists: Vec<Rc<Playlist>>,
+    /// When the playlists were last asked for.
+    playlists_asked: Option<Instant>,
     pub sidebar: Window,
     /// The scrolled part of the sidebar: the playlists.
     pub playlist_window: Window,
@@ -199,6 +205,7 @@ impl App {
             service_note: None,
             liked_uri: None,
             playlists: Vec::new(),
+            playlists_asked: None,
             sidebar: Window::default(),
             playlist_window: Window::default(),
             listing: Listing::new(Source::Liked),
@@ -287,9 +294,7 @@ impl App {
             },
             Msg::LoggedIn => self.screen = Screen::Connecting,
             Msg::LoginFailed(error) => self.screen = Screen::Failed(error),
-            Msg::Playlists(Ok(playlists)) => {
-                self.playlists = playlists.into_iter().map(Rc::new).collect();
-            }
+            Msg::Playlists(Ok(playlists)) => self.playlists_arrived(playlists),
             Msg::Playlists(Err(error)) => self.warn(format!("Cannot load your playlists: {error}")),
             Msg::Uris { generation, result } if generation == self.generation => match result {
                 Ok(uris) => {
@@ -319,6 +324,7 @@ impl App {
             Msg::Uris { .. } | Msg::Tracks { .. } => {}
             Msg::Lyrics { uri, result } => self.lyrics_arrived(uri, result),
             Msg::Notice { text, error } => self.notify(text, error),
+            Msg::Liked(track) => self.liked_added(Rc::new(track)),
         }
     }
 
@@ -361,10 +367,9 @@ impl App {
                 if !in_library {
                     self.enter_library();
                 } else {
-                    if self.playlists.is_empty() {
-                        self.load_playlists();
-                    }
-                    // Back after a reconnect: a list that failed meanwhile loads again.
+                    // Back after a reconnect: playlists may have changed meanwhile,
+                    // and a list that failed loads again.
+                    self.load_playlists();
                     self.retry();
                 }
             }
@@ -548,6 +553,8 @@ impl App {
     }
 
     fn load_playlists(&mut self) {
+        self.playlists_asked = Some(Instant::now());
+        log::debug!("loading the playlists");
         let (tx, service) = (self.tx.clone(), self.service.clone());
         tokio::spawn(async move {
             let result = service.playlists().await;
@@ -613,7 +620,66 @@ impl App {
         if let Some(index) = (0..self.shelf_count()).find(|index| self.shelf_is_current(*index)) {
             self.sidebar.select(index, self.shelf_count());
         }
+        self.focus_sidebar();
+    }
+
+    /// Moves to the sidebar, loading the playlists again if they may be stale:
+    /// one made or renamed in another Spotify app shows up.
+    pub(crate) fn focus_sidebar(&mut self) {
         self.focus = Focus::Sidebar;
+        if self
+            .playlists_asked
+            .is_none_or(|asked| asked.elapsed() >= PLAYLISTS_REFRESH)
+        {
+            self.load_playlists();
+        }
+    }
+
+    /// New playlists replace the old; the highlighted one stays highlighted.
+    fn playlists_arrived(&mut self, playlists: Vec<Playlist>) {
+        let highlighted = self
+            .sidebar
+            .selected
+            .checked_sub(FIXED_SHELVES)
+            .and_then(|index| self.playlists.get(index))
+            .map(|playlist| playlist.uri.clone());
+        self.playlists = playlists.into_iter().map(Rc::new).collect();
+        if let Some(uri) = highlighted {
+            let index = self
+                .playlists
+                .iter()
+                .position(|playlist| playlist.uri == uri)
+                .map_or(self.sidebar.selected, |index| FIXED_SHELVES + index);
+            self.sidebar.select(index, self.shelf_count());
+        }
+    }
+
+    /// Shows a track just saved at the top of Liked Songs, wherever that list is
+    /// loaded: on screen or back in the history. Highlights stay on their songs.
+    fn liked_added(&mut self, track: Rc<Track>) {
+        let add = |listing: &mut Listing, window: &mut Window| {
+            if listing.source != Source::Liked || listing.uris.is_empty() {
+                return false;
+            }
+            let had_rows = !listing.tracks.is_empty();
+            if !listing.insert_first(track.clone()) {
+                return false;
+            }
+            if had_rows {
+                window.select(window.selected + 1, listing.tracks.len());
+            }
+            true
+        };
+        for (listing, window) in &mut self.history {
+            add(listing, window);
+        }
+        if add(&mut self.listing, &mut self.window) && self.listing.loading == Loading::Busy {
+            // The chunk on its way was asked for before the shift; ask again.
+            self.generation += 1;
+            self.listing.loading = Loading::Idle;
+            self.listing.requested = self.listing.tracks.len();
+            self.load_more();
+        }
     }
 
     fn open_shelf(&mut self, index: usize) {
@@ -771,12 +837,16 @@ impl App {
         };
         let (tx, service, name) = (self.tx.clone(), self.service.clone(), track.name.clone());
         let uri = track.uri.clone();
+        let saved = Track::clone(&track);
         tokio::spawn(async move {
             let msg = match service.like(uri).await {
-                Ok(true) => Msg::Notice {
-                    text: format!("Saved “{name}” to Liked Songs."),
-                    error: false,
-                },
+                Ok(true) => {
+                    let _ = tx.send(Msg::Liked(saved));
+                    Msg::Notice {
+                        text: format!("Saved “{name}” to Liked Songs."),
+                        error: false,
+                    }
+                }
                 Ok(false) => Msg::Notice {
                     text: format!("“{name}” is already in Liked Songs."),
                     error: false,

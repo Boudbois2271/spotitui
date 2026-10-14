@@ -275,7 +275,7 @@ impl App {
             KeyCode::Esc => {
                 self.search.clear();
                 self.sidebar.select(0, self.shelf_count());
-                self.focus = Focus::Sidebar;
+                self.focus_sidebar();
             }
             KeyCode::Down => self.focus = Focus::Tracks,
             KeyCode::Backspace => {
@@ -327,7 +327,7 @@ impl App {
         match hit {
             Hit::Action(action) => self.act(action),
             Hit::Shelf(index) => {
-                self.focus = Focus::Sidebar;
+                self.focus_sidebar();
                 self.open_shelf(index);
             }
             Hit::Row(index) => {
@@ -352,7 +352,7 @@ impl App {
             Hit::Progress => self.click_progress(position),
             Hit::Volume => {}
             Hit::SearchInput => self.focus = Focus::Search,
-            Hit::SidebarPane => self.focus = Focus::Sidebar,
+            Hit::SidebarPane => self.focus_sidebar(),
             Hit::TracksPane | Hit::LyricsPane => self.focus = Focus::Tracks,
         }
     }

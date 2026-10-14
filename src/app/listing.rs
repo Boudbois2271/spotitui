@@ -161,6 +161,21 @@ impl Listing {
         }
     }
 
+    /// Puts a track first, as Liked Songs lists the latest saved first. Returns
+    /// whether it was added (it wasn't listed yet).
+    pub fn insert_first(&mut self, track: Rc<Track>) -> bool {
+        if self.uris.iter().any(|uri| *uri == track.uri) {
+            return false;
+        }
+        let uris: Vec<String> = std::iter::once(track.uri.clone())
+            .chain(self.uris.iter().cloned())
+            .collect();
+        self.uris = uris.into();
+        self.tracks.insert(0, track);
+        self.requested += 1;
+        true
+    }
+
     pub fn fail(&mut self, failure: Failure) {
         self.loading = Loading::Failed(failure);
         self.failed_at = Some(Instant::now());
@@ -289,6 +304,19 @@ mod tests {
         // A late answer for an older position is ignored.
         listing.take_chunk(0, &chunk, vec![track("spotify:track:0")]);
         assert_eq!(listing.tracks.len(), 5);
+    }
+
+    #[test]
+    fn a_saved_track_goes_first_once() {
+        let mut listing = listing(3);
+        let chunk: Vec<String> = listing.uris[..2].to_vec();
+        listing.requested = 2;
+        listing.take_chunk(0, &chunk, chunk.iter().map(|uri| track(uri)).collect());
+        assert!(listing.insert_first(std::rc::Rc::new(track("spotify:track:new"))));
+        assert_eq!(listing.uris[0], "spotify:track:new");
+        assert_eq!(listing.tracks[0].uri, "spotify:track:new");
+        assert_eq!((listing.uris.len(), listing.tracks.len(), listing.requested), (4, 3, 3));
+        assert!(!listing.insert_first(std::rc::Rc::new(track("spotify:track:new"))));
     }
 
     #[test]
