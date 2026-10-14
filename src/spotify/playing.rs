@@ -132,6 +132,29 @@ impl Playing {
         self.status == Status::Playing
     }
 
+    /// Spotify sometimes plays another copy of a track than the one listed (a
+    /// version available in this country): the track change names the copy,
+    /// while "playing" and "paused" name the listed track. Lists, the play
+    /// queue and the bar widget know the listed one, so the record takes it.
+    /// Returns the corrected track; called before [`Playing::apply`].
+    pub fn relink(&mut self, event: &PlayerEvent) -> Option<NowTrack> {
+        let (PlayerEvent::Playing { track_id, .. } | PlayerEvent::Paused { track_id, .. }) = event
+        else {
+            return None;
+        };
+        let listed = track_id.to_uri().ok()?;
+        let track = self.track.as_mut()?;
+        if track.uri == listed
+            || !listed.starts_with("spotify:track:")
+            || !track.uri.starts_with("spotify:track:")
+        {
+            return None;
+        }
+        log::debug!("{} plays as {}; showing it as listed", listed, track.uri);
+        track.uri = listed;
+        Some(track.clone())
+    }
+
     /// Takes a speaker event; returns what changed, as windows hear it.
     pub fn apply(&mut self, event: &PlayerEvent) -> Option<PlayerUpdate> {
         let ms = |position_ms: u32| Duration::from_millis(position_ms.into());
@@ -256,6 +279,30 @@ mod tests {
         assert_eq!(clock.elapsed(), stopped, "a stopped clock stands still");
         clock.report(Duration::from_secs(60), false);
         assert_eq!(clock.elapsed(), Duration::from_secs(10), "never past the end");
+    }
+
+    #[test]
+    fn a_relinked_track_takes_the_listed_uri() {
+        let mut playing = Playing::new(0);
+        playing.track = Some(crate::spotify::NowTrack {
+            uri: "spotify:track:6pnwfWyaWjQiHCKTiZLItr".into(),
+            name: "Shine On You Crazy Diamond".into(),
+            artists: Vec::new(),
+            album: String::new(),
+            album_artists: Vec::new(),
+            duration_ms: 1,
+            art_url: None,
+        });
+        let listed = librespot_core::SpotifyUri::from_uri("spotify:track:32dnKMni3I3gwUbWp4mi45")
+            .expect("a valid URI");
+        let event = PlayerEvent::Playing {
+            play_request_id: 0,
+            track_id: listed.clone(),
+            position_ms: 0,
+        };
+        let corrected = playing.relink(&event).expect("relinked");
+        assert_eq!(corrected.uri, "spotify:track:32dnKMni3I3gwUbWp4mi45");
+        assert!(playing.relink(&event).is_none(), "once is enough");
     }
 
     #[test]

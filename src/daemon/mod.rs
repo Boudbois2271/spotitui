@@ -489,8 +489,9 @@ impl Daemon {
         if let PlayerEvent::TrackChanged { audio_item } = &event {
             self.playing.send_replace(Some(audio_item.uri.clone()));
         }
-        let (update, resend_volume) = {
+        let (relinked, update, resend_volume) = {
             let mut state = self.state();
+            let relinked = state.playing().relink(&event);
             let update = state.apply(&event);
             // The speaker is active once it plays; a volume it ignored before applies now.
             let resend = match (&update, state.wanted_volume) {
@@ -501,8 +502,16 @@ impl Daemon {
                 }
                 _ => None,
             };
-            (update, resend)
+            (relinked, update, resend)
         };
+        if let Some(track) = relinked {
+            self.playing.send_replace(Some(track.uri.clone()));
+            let update = PlayerUpdate::Track(track);
+            if let Some(mpris) = mpris {
+                mpris.changed(&update).await;
+            }
+            self.broadcast(Event::Player(update));
+        }
         if let Some(volume) = resend_volume
             && let Ok(speaker) = self.speaker()
             && let Err(error) = speaker.command(Command::Volume(volume))
