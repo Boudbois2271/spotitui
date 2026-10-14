@@ -604,7 +604,6 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
         }
     };
 
-    observer.abort();
     daemon.playing.send_replace(None);
     set_slot(&daemon.slot, None);
     let live = daemon.state().disconnect();
@@ -614,13 +613,17 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
     }
     drop(live);
     // Spirc pauses, marks this device inactive and removes it from Spotify's
-    // device list before its task ends; give it the time to.
-    if !session_ended {
-        match tokio::time::timeout(GOODBYE_TIMEOUT, ended).await {
-            Ok(_) => log::info!("the speaker left Spotify"),
-            Err(_) => log::warn!("the speaker didn't leave Spotify in time"),
+    // device list before its task ends; give it the time to, while the
+    // observer closes its own session.
+    let goodbye = async {
+        if !session_ended {
+            match tokio::time::timeout(GOODBYE_TIMEOUT, ended).await {
+                Ok(_) => log::info!("the speaker left Spotify"),
+                Err(_) => log::warn!("the speaker didn't leave Spotify in time"),
+            }
         }
-    }
+    };
+    tokio::join!(observer.stop(), goodbye);
     queue::clear();
     if let Some(mpris) = mpris {
         mpris.refresh().await;

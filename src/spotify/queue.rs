@@ -41,12 +41,36 @@ const BACKOFF: [Duration; 4] = [
 ];
 /// An observer that ran this long without trouble starts over at the shortest wait.
 const HEALTHY_RUN: Duration = Duration::from_secs(300);
-/// How long the observer may take to show a track the speaker started.
+/// How long the observer may stay silent after the speaker changes track.
 const FOLLOW_TIMEOUT: Duration = Duration::from_secs(15);
 /// How often the observer checks that its session is still alive.
 const CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// For logging in, starting the dealer and registering as an observer.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(45);
+/// For leaving: removing the device and closing the dealer.
+const CLEANUP_TIMEOUT: Duration = Duration::from_secs(3);
+/// How long [`Observer::stop`] waits for the cleanup before cutting it short.
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A running play queue observer.
+pub struct Observer {
+    stop: watch::Sender<bool>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Observer {
+    /// Stops the observer and lets it close its session. Aborting it instead
+    /// would leak that session: librespot's dealer task keeps it alive, with its
+    /// connections, for the life of the process.
+    pub async fn stop(self) {
+        let _ = self.stop.send(true);
+        let abort = self.task.abort_handle();
+        if tokio::time::timeout(STOP_TIMEOUT, self.task).await.is_err() {
+            log::warn!("the play queue observer didn't stop in time");
+            abort.abort();
+        }
+    }
+}
 
 /// A track in the published list.
 #[derive(Serialize, Clone, Debug, PartialEq, Eq)]
@@ -85,11 +109,11 @@ struct Snapshot<'a> {
 }
 
 /// Watches the play queue from a hidden observer session and calls `report`
-/// whenever the tracks around the playing one change, until aborted.
+/// whenever the tracks around the playing one change, until stopped.
 ///
 /// The observer logs in with the main session's reusable credentials, so it
 /// needs no token of its own. It starts over (after a pause) when it fails,
-/// when its session dies, and when the speaker starts a track it doesn't show
+/// when its session dies, and when the speaker changes track and no update comes
 /// within [`FOLLOW_TIMEOUT`]: librespot's dealer gives up reconnecting after
 /// one failed attempt and then stays silent, with no error to notice.
 /// `playing` is the track the speaker plays.
@@ -97,12 +121,16 @@ pub fn observe(
     catalog: Catalog,
     playing: watch::Receiver<Option<String>>,
     report: impl Fn(Around) + Send + Sync + 'static,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
+) -> Observer {
+    let (stop, stopped) = watch::channel(false);
+    let task = tokio::spawn(async move {
         let mut failures = 0;
         loop {
             let started = Instant::now();
-            let result = run_observer(&catalog, playing.clone(), &report).await;
+            let result = run_observer(&catalog, playing.clone(), stopped.clone(), &report).await;
+            if *stopped.borrow() {
+                return;
+            }
             if started.elapsed() >= HEALTHY_RUN {
                 failures = 0;
             }
@@ -114,9 +142,14 @@ pub fn observe(
                     log::warn!("cannot follow the play queue ({error}); retrying in {delay:?}");
                 }
             }
-            tokio::time::sleep(delay).await;
+            let mut stopped = stopped.clone();
+            tokio::select! {
+                () = tokio::time::sleep(delay) => {}
+                _ = stopped.wait_for(|stop| *stop) => return,
+            }
         }
-    })
+    });
+    Observer { stop, task }
 }
 
 /// The main session's login, reusable by another session.
@@ -131,6 +164,7 @@ fn reusable_credentials(main: &Session) -> Credentials {
 async fn run_observer(
     catalog: &Catalog,
     mut playing: watch::Receiver<Option<String>>,
+    mut stopped: watch::Receiver<bool>,
     report: &impl Fn(Around),
 ) -> Result<(), Error> {
     let config = SessionConfig {
@@ -138,10 +172,19 @@ async fn run_observer(
         ..SessionConfig::default()
     };
     let session = Session::new(config, None);
-    let result = follow(&session, catalog, &mut playing, report).await;
-    // Leave Spotify's device list and stop the dealer's reconnect loop.
-    let _ = session.spclient().delete_connect_state_request().await;
-    session.dealer().close().await;
+    let result = tokio::select! {
+        result = follow(&session, catalog, &mut playing, report) => result,
+        _ = stopped.wait_for(|stop| *stop) => Ok(()),
+    };
+    // Leave Spotify's device list and stop the dealer's reconnect loop, which
+    // otherwise keeps the session and its connections alive.
+    let cleanup = async {
+        let _ = session.spclient().delete_connect_state_request().await;
+        session.dealer().close().await;
+    };
+    if tokio::time::timeout(CLEANUP_TIMEOUT, cleanup).await.is_err() {
+        log::debug!("the play queue observer's session didn't close in time");
+    }
     session.shutdown();
     result
 }
@@ -177,7 +220,7 @@ async fn follow(
 
     let mut names: HashMap<String, (String, String)> = HashMap::new();
     let mut last: Option<Around> = None;
-    // Set while the speaker plays a track this observer hasn't shown yet.
+    // Set when the speaker changed track and no update has come since.
     let mut behind_since: Option<Instant> = None;
     let mut check = tokio::time::interval(CHECK_INTERVAL);
     loop {
@@ -227,10 +270,11 @@ async fn follow(
                 None => return Ok(()),
             },
         };
+        // Any update after a track change shows the observer still hears Spotify.
+        // (Its track may not match the speaker's URI exactly: Spotify relinks
+        // tracks to other copies for some countries.)
+        behind_since = None;
         let around = around(&cluster.player_state, catalog, &mut names).await;
-        if shows(Some(&around), playing.borrow().as_deref()) {
-            behind_since = None;
-        }
         if last.as_ref() != Some(&around) {
             report(around.clone());
             last = Some(around);
