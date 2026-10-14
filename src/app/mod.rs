@@ -179,6 +179,9 @@ pub struct App {
     /// "Find in this list", while open.
     pub finder: Option<finder::Finder>,
     notice: Option<Notice>,
+    /// The service is another version than this window: shown whenever no
+    /// newer notice is, until a matching service connects.
+    mismatch: Option<Notice>,
     pub ticks: u64,
     pub hits: Vec<(Rect, Hit)>,
     pending_g: bool,
@@ -222,6 +225,7 @@ impl App {
             picker: None,
             finder: None,
             notice: None,
+            mismatch: None,
             ticks: 0,
             hits: Vec::new(),
             pending_g: false,
@@ -339,12 +343,16 @@ impl App {
 
     /// The service's whole state, sent when this window connects.
     fn apply_snapshot(&mut self, snapshot: Snapshot) {
-        if snapshot.protocol != protocol::VERSION {
+        self.mismatch = (snapshot.protocol != protocol::VERSION).then(|| {
             let text = protocol::mismatch(snapshot.protocol);
             log::warn!("{text}");
             self.service_note = Some(text.clone());
-            self.warn(text);
-        }
+            Notice {
+                text,
+                error: true,
+                shown: Instant::now(),
+            }
+        });
         match snapshot.track {
             Some(track) if self.now.uri() != Some(track.uri.as_str()) => self.track_changed(track),
             Some(_) => {}
@@ -432,6 +440,7 @@ impl App {
         self.notice
             .as_ref()
             .filter(|notice| notice.shown.elapsed() < NOTICE_TIME)
+            .or(self.mismatch.as_ref())
     }
 
     fn notify(&mut self, text: String, error: bool) {
