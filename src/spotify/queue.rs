@@ -19,7 +19,6 @@ use librespot_protocol::{
     player::{PlayerState, ProvidedTrack},
 };
 use protobuf::{EnumOrUnknown, Message as _, MessageField};
-use rand::Rng;
 use serde::Serialize;
 use std::{collections::HashMap, path::PathBuf};
 
@@ -170,11 +169,10 @@ pub(super) fn observer(session: &Session) -> PutStateRequest {
     }
 }
 
-/// Web player observers are named "hobs_" and a random hex id.
+/// Web player observers are named "hobs_" and a hex id. Stable, so restarts
+/// don't leave a trail of hidden devices behind.
 pub(super) fn observer_id() -> String {
-    let bytes: [u8; 16] = rand::rng().random();
-    let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!("hobs_{hex}")
+    format!("hobs_{}", super::device_id("observer", 32))
 }
 
 async fn around(

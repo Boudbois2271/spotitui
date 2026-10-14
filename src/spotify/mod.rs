@@ -36,6 +36,24 @@ pub fn http() -> reqwest::Client {
         .unwrap_or_default()
 }
 
+/// A device ID that stays the same across reconnects and restarts, so Spotify
+/// sees one spotitui per computer rather than a new device each time (librespot's
+/// default is a random UUID per session). Hex, as librespot's own player uses.
+pub(crate) fn device_id(purpose: &str, length: usize) -> String {
+    use sha2::{Digest, Sha256};
+    let machine = std::fs::read_to_string("/etc/machine-id")
+        .or_else(|_| std::fs::read_to_string("/var/lib/dbus/machine-id"))
+        .unwrap_or_default();
+    let digest = Sha256::digest(format!("{}\n{DEVICE_NAME}\n{purpose}", machine.trim()));
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+        .chars()
+        .take(length)
+        .collect()
+}
+
 /// Runs `task` on the runtime's workers, giving up (and stopping it) after
 /// `limit`. librespot's own HTTP requests have no timeout.
 pub(crate) async fn bounded<T: Send + 'static>(
@@ -94,6 +112,15 @@ mod tests {
         },
         time::Duration,
     };
+
+    #[test]
+    fn device_ids_are_stable_and_distinct() {
+        let speaker = super::device_id("speaker", 40);
+        assert_eq!(speaker.len(), 40);
+        assert!(speaker.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_eq!(speaker, super::device_id("speaker", 40));
+        assert_ne!(speaker, super::device_id("observer", 40));
+    }
 
     #[tokio::test]
     async fn slow_requests_give_up_and_stop() {

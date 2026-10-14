@@ -238,7 +238,11 @@ async fn start(access_token: String, initial_volume: u16) -> Result<Connection, 
         .or_else(|| audio_backend::find(None))
         .ok_or(Error::NoAudio)?;
     let mixer = Arc::new(MuteMixer::open(MixerConfig::default())?);
-    let session = Session::new(SessionConfig::default(), None);
+    let config = SessionConfig {
+        device_id: super::device_id("speaker", 40),
+        ..SessionConfig::default()
+    };
+    let session = Session::new(config, None);
     let player = Player::new(
         PlayerConfig::default(),
         session.clone(),

@@ -180,7 +180,7 @@ async fn live_cluster() {
         .expect("token refreshes");
     token.store().expect("token stored");
     let config = SessionConfig {
-        device_id: queue::observer_id(),
+        device_id: format!("hobs_{}", super::device_id("live test", 32)),
         ..SessionConfig::default()
     };
     let session = Session::new(config, None);
