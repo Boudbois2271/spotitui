@@ -1,0 +1,4 @@
+#!/bin/bash
+# Focuses the spotitui window if one is open, else opens one. The app-id makes
+# the window findable without matching terminals whose title mentions spotitui.
+exec omarchy-launch-or-focus '^spotitui$' 'xdg-terminal-exec --app-id=spotitui spotitui'

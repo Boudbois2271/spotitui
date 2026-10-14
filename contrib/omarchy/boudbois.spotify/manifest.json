@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "boudbois.spotify",
+  "name": "Spotify",
+  "version": "1.0.0",
+  "author": "boudbois",
+  "license": "MIT",
+  "description": "Now playing in spotitui: title, controls, progress and the tracks around the current one.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Spotify",
+    "description": "Spotify logo; click for the spotitui mini player.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

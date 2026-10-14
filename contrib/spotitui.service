@@ -1,0 +1,17 @@
+# The spotitui background service: plays music, serves media keys (MPRIS) and
+# the Omarchy bar widget, and serves player windows. Install:
+#   install -Dm644 contrib/spotitui.service ~/.config/systemd/user/spotitui.service
+#   systemctl --user daemon-reload && systemctl --user enable --now spotitui.service
+[Unit]
+Description=spotitui Spotify player service
+Documentation=file://%h/Work/spotitui/README.md
+PartOf=graphical-session.target
+After=graphical-session.target pipewire-pulse.service
+
+[Service]
+ExecStart=%h/.local/bin/spotitui daemon
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=graphical-session.target

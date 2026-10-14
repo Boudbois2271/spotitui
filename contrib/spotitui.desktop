@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=spotitui
+Comment=Spotify in the terminal, in your Omarchy theme
+Exec=spotitui-open
+Terminal=false
+Icon=spotify
+Categories=AudioVideo;Audio;Player;
