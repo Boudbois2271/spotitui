@@ -5,7 +5,8 @@
 
 use crate::{
     protocol::{
-        self, ClientMessage, Event, Request, Response, ServerMessage, read_message, write_message,
+        self, ClientMessage, Event, Incoming, Request, Response, ServerMessage, read_line,
+        write_message,
     },
     spotify::{Lyrics, NowTrack, Playlist, Track},
 };
@@ -113,6 +114,10 @@ fn not_running() -> String {
     "The spotitui service isn't running yet".into()
 }
 
+fn unreadable() -> String {
+    "The spotitui service answered in a newer format; restart this window".into()
+}
+
 fn unexpected(response: &Response) -> String {
     format!("The spotitui service answered unexpectedly ({response:?})")
 }
@@ -174,7 +179,27 @@ async fn session(
     let reader = tokio::spawn(async move {
         let mut reader = BufReader::new(read);
         let mut line = String::new();
-        while let Ok(Some(message)) = read_message::<ServerMessage>(&mut reader, &mut line).await {
+        while let Ok(true) = read_line(&mut reader, &mut line).await {
+            let message = match protocol::parse::<ServerMessage>(&line) {
+                Ok(Incoming::Message(message)) => message,
+                // From a newer service: an answer this window can't read fails its
+                // request; an unknown event is skipped.
+                Ok(Incoming::Unknown { id: Some(id), error }) => {
+                    log::warn!("unreadable answer from the service: {error}");
+                    ServerMessage::Reply {
+                        id,
+                        result: Err(unreadable()),
+                    }
+                }
+                Ok(Incoming::Unknown { id: None, error }) => {
+                    log::warn!("skipping an event from the service: {error}");
+                    continue;
+                }
+                Err(error) => {
+                    log::warn!("the service sent something unreadable: {error}");
+                    return;
+                }
+            };
             if incoming_tx.send(message).is_err() {
                 return;
             }
@@ -260,8 +285,12 @@ pub async fn logout() {
     let mut reader = BufReader::new(read);
     let mut line = String::new();
     let wait_reply = async {
-        while let Ok(Some(message)) = read_message::<ServerMessage>(&mut reader, &mut line).await {
-            if matches!(message, ServerMessage::Reply { id: 1, .. }) {
+        while let Ok(true) = read_line(&mut reader, &mut line).await {
+            if let Ok(
+                Incoming::Message(ServerMessage::Reply { id: 1, .. })
+                | Incoming::Unknown { id: Some(1), .. },
+            ) = protocol::parse::<ServerMessage>(&line)
+            {
                 return;
             }
         }

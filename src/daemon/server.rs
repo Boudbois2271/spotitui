@@ -1,7 +1,9 @@
 //! The service's Unix socket: one task per connected player window.
 
 use super::Daemon;
-use crate::protocol::{ClientMessage, Event, ServerMessage, read_message, write_message};
+use crate::protocol::{
+    self, ClientMessage, Event, Incoming, ServerMessage, read_line, write_message,
+};
 use std::{path::Path, sync::Arc};
 use tokio::{
     io::BufReader,
@@ -73,11 +75,30 @@ async fn serve_window(daemon: Arc<Daemon>, stream: UnixStream) {
     let mut reader = BufReader::new(read);
     let mut line = String::new();
     loop {
-        let message = match read_message::<ClientMessage>(&mut reader, &mut line).await {
-            Ok(Some(message)) => message,
-            Ok(None) => break,
+        match read_line(&mut reader, &mut line).await {
+            Ok(true) => {}
+            Ok(false) => break,
             Err(error) => {
-                log::warn!("dropping a window that sent an unreadable message: {error}");
+                log::warn!("cannot read from a window: {error}");
+                break;
+            }
+        }
+        let message = match protocol::parse::<ClientMessage>(&line) {
+            Ok(Incoming::Message(message)) => message,
+            // A newer window asking for something this service doesn't know yet:
+            // answer it, and keep the connection.
+            Ok(Incoming::Unknown { id, error }) => {
+                log::warn!("a window sent a request this service doesn't know: {error}");
+                if let Some(id) = id {
+                    let _ = outgoing.send(ServerMessage::Reply {
+                        id,
+                        result: Err(too_old()),
+                    });
+                }
+                continue;
+            }
+            Err(error) => {
+                log::warn!("dropping a window that sent something unreadable: {error}");
                 break;
             }
         };
@@ -95,4 +116,12 @@ async fn serve_window(daemon: Arc<Daemon>, stream: UnixStream) {
     drop(outgoing);
     // The writer ends once in-flight replies are written or dropped.
     let _ = writer.await;
+}
+
+fn too_old() -> String {
+    format!(
+        "The spotitui service doesn't know this request; it is older than this window \
+         (protocol {}). Restart it: systemctl --user restart spotitui",
+        protocol::VERSION
+    )
 }

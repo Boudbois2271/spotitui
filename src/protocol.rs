@@ -9,6 +9,19 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::PathBuf;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
+/// Bumped whenever a message changes shape, so a window and a service built from
+/// different versions notice it instead of misreading each other.
+pub const VERSION: u32 = 1;
+
+/// What a window shows when it and the service speak different versions.
+pub fn mismatch(service: u32) -> String {
+    let side = if service < VERSION { "older" } else { "newer" };
+    format!(
+        "The spotitui service is {side} than this window (protocol {service}, window {VERSION}); \
+         restart it: systemctl --user restart spotitui"
+    )
+}
+
 /// Where the service listens; `None` without `$XDG_RUNTIME_DIR`.
 pub fn socket_path() -> Option<PathBuf> {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
@@ -99,6 +112,9 @@ pub enum Status {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Snapshot {
+    /// The service's [`VERSION`]; 0 from services that predate it.
+    #[serde(default)]
+    pub protocol: u32,
     pub status: Status,
     pub track: Option<NowTrack>,
     pub playing: bool,
@@ -136,13 +152,49 @@ pub async fn write_message<T: Serialize>(
     writer.write_all(&line).await
 }
 
+/// Reads one line; `Ok(false)` at the end of the stream.
+pub async fn read_line(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    line: &mut String,
+) -> std::io::Result<bool> {
+    line.clear();
+    Ok(reader.read_line(line).await? != 0)
+}
+
+/// One line read and understood, or the reason it couldn't be.
+pub enum Incoming<T> {
+    Message(T),
+    /// Valid JSON this build doesn't know, such as from a newer version. `id` is
+    /// the request it answers or asks, when it has one.
+    Unknown { id: Option<u64>, error: String },
+}
+
+/// Parses a line, telling apart messages from another version from garbage.
+pub fn parse<T: DeserializeOwned>(line: &str) -> Result<Incoming<T>, serde_json::Error> {
+    match serde_json::from_str(line) {
+        Ok(message) => Ok(Incoming::Message(message)),
+        Err(error) => {
+            let value: serde_json::Value = serde_json::from_str(line)?;
+            // A window's request carries `id`; the service's reply carries `Reply.id`.
+            let id = value
+                .get("id")
+                .or_else(|| value.get("Reply")?.get("id"))
+                .and_then(serde_json::Value::as_u64);
+            Ok(Incoming::Unknown {
+                id,
+                error: error.to_string(),
+            })
+        }
+    }
+}
+
 /// Reads one message; `Ok(None)` at the end of the stream.
+#[cfg(test)]
 pub async fn read_message<T: DeserializeOwned>(
     reader: &mut (impl AsyncBufRead + Unpin),
     line: &mut String,
 ) -> std::io::Result<Option<T>> {
-    line.clear();
-    if reader.read_line(line).await? == 0 {
+    if !read_line(reader, line).await? {
         return Ok(None);
     }
     serde_json::from_str(line)
@@ -153,7 +205,8 @@ pub async fn read_message<T: DeserializeOwned>(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientMessage, Event, PlayerUpdate, Request, ServerMessage, read_message, write_message,
+        ClientMessage, Event, Incoming, PlayerUpdate, Request, ServerMessage, mismatch, parse,
+        read_message, write_message,
     };
     use tokio::io::BufReader;
 
@@ -189,5 +242,29 @@ mod tests {
         ));
         let end: Option<ServerMessage> = read_message(&mut reader, &mut line).await.expect("reads");
         assert!(end.is_none());
+    }
+
+    #[test]
+    fn messages_from_another_version_keep_their_id() {
+        let request = parse::<ClientMessage>(r#"{"id":4,"request":"Teleport"}"#).expect("json");
+        assert!(matches!(request, Incoming::Unknown { id: Some(4), .. }));
+        let reply = parse::<ServerMessage>(r#"{"Reply":{"id":9,"result":{"Ok":{"Hologram":1}}}}"#)
+            .expect("json");
+        assert!(matches!(reply, Incoming::Unknown { id: Some(9), .. }));
+        let event = parse::<ServerMessage>(r#"{"Event":{"Player":{"Warp":3}}}"#).expect("json");
+        assert!(matches!(event, Incoming::Unknown { id: None, .. }));
+        assert!(parse::<ServerMessage>("not json").is_err());
+    }
+
+    #[test]
+    fn snapshots_from_older_services_have_protocol_zero() {
+        let line = r#"{"Event":{"Snapshot":{"status":"Connecting","track":null,"playing":false,
+            "position_ms":0,"volume":1,"shuffle":false,"repeat":"Off"}}}"#;
+        let Ok(Incoming::Message(ServerMessage::Event(Event::Snapshot(snapshot)))) = parse(line)
+        else {
+            panic!("an old snapshot still parses");
+        };
+        assert_eq!(snapshot.protocol, 0);
+        assert!(mismatch(0).contains("older"));
     }
 }

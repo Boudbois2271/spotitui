@@ -9,7 +9,7 @@ pub mod playback;
 
 use crate::{
     client::{Notification, Service},
-    protocol::{Event, PlayerUpdate, Request, Snapshot, Status},
+    protocol::{self, Event, PlayerUpdate, Request, Snapshot, Status},
     spotify::{self, Authorization, Command, Lyrics, Mode, Play, Playlist, Track},
     theme::{Theme, ThemeSource},
 };
@@ -318,6 +318,12 @@ impl App {
 
     /// The service's whole state, sent when this window connects.
     fn apply_snapshot(&mut self, snapshot: Snapshot) {
+        if snapshot.protocol != protocol::VERSION {
+            let text = protocol::mismatch(snapshot.protocol);
+            log::warn!("{text}");
+            self.service_note = Some(text.clone());
+            self.warn(text);
+        }
         match snapshot.track {
             Some(track) if self.now.uri() != Some(track.uri.as_str()) => self.track_changed(track),
             Some(_) => {}

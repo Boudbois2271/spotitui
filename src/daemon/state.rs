@@ -1,7 +1,7 @@
 //! What the service knows: its connection to Spotify and what the speaker plays.
 
 use crate::{
-    protocol::{PlayerUpdate, Snapshot, Status},
+    protocol::{self, PlayerUpdate, Snapshot, Status},
     spotify::{self, Catalog, Play, Repeat, Speaker},
 };
 use librespot_playback::player::PlayerEvent;
@@ -92,6 +92,7 @@ impl State {
 
     pub fn snapshot(&self) -> Snapshot {
         Snapshot {
+            protocol: protocol::VERSION,
             status: self.status.clone(),
             track: self.player.track.clone(),
             playing: self.player.playing,
