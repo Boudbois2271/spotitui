@@ -43,6 +43,8 @@ const GOODBYE_TIMEOUT: Duration = Duration::from_secs(3);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often a renewed login the keyring refused is offered to it again.
 const SAVE_LOGIN_INTERVAL: Duration = Duration::from_secs(60);
+/// How often the session is checked for a lost connection.
+const SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -582,6 +584,7 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
     daemon.set_status(Status::Connected { liked_uri });
     // Playlist names label the bar widget's queue; a failure only costs labels.
     let names = daemon.clone();
+    let session = catalog.session().clone();
     tokio::spawn(async move {
         if let Ok(playlists) = catalog.playlists().await {
             names.state().remember_playlists(&playlists);
@@ -590,8 +593,19 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
 
     let mut save_login = tokio::time::interval(SAVE_LOGIN_INTERVAL);
     save_login.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut check_session = tokio::time::interval(SESSION_CHECK_INTERVAL);
+    check_session.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let session_ended = loop {
         tokio::select! {
+            // librespot marks the session invalid as soon as the server
+            // connection closes, but Spirc only notices on its next event: a
+            // command sent meanwhile would be lost. Reconnect right away instead.
+            _ = check_session.tick() => {
+                if session.is_invalid() {
+                    log::info!("the connection to Spotify was lost");
+                    break true;
+                }
+            }
             _ = save_login.tick() => {
                 daemon.save_login().await;
             }
