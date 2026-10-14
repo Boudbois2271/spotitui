@@ -117,10 +117,16 @@ async fn play() -> Result<()> {
     );
 
     let mut terminal = setup_terminal()?;
-    let hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
-        hook(info);
+    // Puts the terminal back however the loop ends, a panic included.
+    let _restore = Restore;
+    // The message is kept for after the terminal is back. A panic in a
+    // background task doesn't end the window, so it must not touch the terminal.
+    std::panic::set_hook(Box::new(|info| {
+        let text = info.to_string();
+        log::error!("{text}");
+        if let Ok(mut last) = LAST_PANIC.lock() {
+            *last = Some(text);
+        }
     }));
 
     let mut events = EventStream::new();
@@ -129,7 +135,7 @@ async fn play() -> Result<()> {
     let mut terminate = signal(SignalKind::terminate())?;
     let mut hangup = signal(SignalKind::hangup())?;
 
-    let result = loop {
+    loop {
         if let Err(error) = terminal.draw(|frame| ui::draw(frame, &mut app)) {
             break Err(error.into());
         }
@@ -149,10 +155,22 @@ async fn play() -> Result<()> {
         if app.quit {
             break Ok(());
         }
-    };
+    }
+}
 
-    restore_terminal();
-    result
+static LAST_PANIC: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+struct Restore;
+
+impl Drop for Restore {
+    fn drop(&mut self) {
+        restore_terminal();
+        if std::thread::panicking()
+            && let Some(text) = LAST_PANIC.lock().ok().and_then(|mut last| last.take())
+        {
+            let _ = writeln!(std::io::stderr(), "spotitui crashed: {text}");
+        }
+    }
 }
 
 fn setup_terminal() -> std::io::Result<Terminal<CrosstermBackend<Stdout>>> {

@@ -24,6 +24,8 @@ const PATH: &str = "/org/mpris/MediaPlayer2";
 const BUS_NAME: &str = "org.mpris.MediaPlayer2.spotitui";
 const NO_TRACK: &str = "/org/mpris/MediaPlayer2/TrackList/NoTrack";
 const TRACK_URL: &str = "https://open.spotify.com/track/";
+/// Each skipped track is a command to the speaker; the bar widget uses -1..3.
+const MAX_SKIP: u32 = 20;
 
 /// The speaker MPRIS controls. The service keeps one MPRIS player for its whole
 /// life and points it at each new Spirc as it reconnects; `None` between sessions.
@@ -422,6 +424,11 @@ impl Queue {
     /// track, 2 the one after next. Unlike MPRIS Previous, going back never just
     /// restarts the current track. Shuffle order and queued tracks are kept.
     fn skip(&self, offset: i32) -> fdo::Result<()> {
+        if offset.unsigned_abs() > MAX_SKIP {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "skip at most {MAX_SKIP} tracks either way, not {offset}"
+            )));
+        }
         let spirc = current(&self.slot)?;
         failed(skip(&spirc, offset))
     }

@@ -204,7 +204,9 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
         while rest.width() > width {
             let mut cut = String::new();
             for character in rest.chars() {
-                if (cut.clone() + &character.to_string()).width() > width {
+                // A character wider than the whole line still goes, alone, or this
+                // would never move on.
+                if !cut.is_empty() && (cut.clone() + &character.to_string()).width() > width {
                     break;
                 }
                 cut.push(character);
@@ -214,7 +216,10 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
         }
         line = rest;
     }
-    lines.push(line);
+    // A word split to its last character leaves nothing over for a line of its own.
+    if !line.is_empty() || lines.is_empty() {
+        lines.push(line);
+    }
     lines
 }
 
@@ -235,5 +240,8 @@ mod tests {
         assert_eq!(wrap("one two three", 7), ["one two", "three"]);
         assert_eq!(wrap("abcdefghij", 4), ["abcd", "efgh", "ij"]);
         assert_eq!(wrap("", 4), [""]);
+        // Wider characters than the line: one per line, rather than looping forever.
+        assert_eq!(wrap("사랑해", 1), ["사", "랑", "해"]);
+        assert_eq!(wrap("🙏", 1), ["🙏"]);
     }
 }
