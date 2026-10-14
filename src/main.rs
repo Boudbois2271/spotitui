@@ -67,12 +67,15 @@ fn dispatch() -> Result<()> {
         [] => run(),
         ["daemon"] => daemon::run(),
         ["logout"] => {
-            spotify::forget()?;
-            // A running service lets go of the session too.
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
-                .block_on(client::logout());
+                .block_on(async {
+                    spotify::forget().await?;
+                    // A running service lets go of the session too.
+                    client::logout().await;
+                    Ok::<(), spotify::Error>(())
+                })?;
             println!("Logged out. Your Spotify login is removed from this computer.");
             Ok(())
         }

@@ -223,8 +223,17 @@ impl App {
 
     // ── Login ───────────────────────────────────────────────────────────
 
+    /// Whether the screen asks the user to log in.
+    pub fn needs_login(&self) -> bool {
+        match &self.screen {
+            Screen::LoggedOut => true,
+            Screen::Failed(failure) => failure.kind == Kind::NeedsLogin,
+            _ => false,
+        }
+    }
+
     fn log_in(&mut self) {
-        if !matches!(self.screen, Screen::LoggedOut | Screen::Failed(_)) {
+        if !self.needs_login() {
             return;
         }
         let authorization = Authorization::new();
@@ -239,10 +248,11 @@ impl App {
         let (http, tx, service) = (self.http.clone(), self.tx.clone(), self.service.clone());
         let page = callback_page(&self.theme);
         tokio::spawn(async move {
-            let local = |error: spotify::Error| Failure::new(Kind::Other, error.to_string());
+            // Still logged out, so the login button stays.
+            let local = |error: spotify::Error| Failure::new(Kind::NeedsLogin, error.to_string());
             let result = async {
                 let token = authorization.complete(&http, &page).await.map_err(local)?;
-                token.store().map_err(local)?;
+                token.store().await.map_err(local)?;
                 // The service reads the login from the keyring.
                 service.done(Request::Reconnect).await
             }
@@ -350,6 +360,10 @@ impl App {
             Status::Connecting if in_library => self.inform("Reconnecting to Spotify…"),
             Status::Connecting if !waiting => self.screen = Screen::Connecting,
             Status::LoggedOut if !waiting => self.screen = Screen::LoggedOut,
+            // The login is gone: only logging in again helps, so show how.
+            Status::Failed(error) if error.kind == Kind::NeedsLogin && !waiting => {
+                self.screen = Screen::Failed(error);
+            }
             Status::Failed(error) if in_library => self.warn(error.message),
             Status::Failed(error) if !waiting => self.screen = Screen::Failed(error),
             // A browser login in progress keeps its screen.

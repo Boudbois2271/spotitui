@@ -41,6 +41,8 @@ const EVENT_BACKLOG: usize = 256;
 const GOODBYE_TIMEOUT: Duration = Duration::from_secs(3);
 /// How long stopping waits for the session to wind down, goodbye included.
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// How often a renewed login the keyring refused is offered to it again.
+const SAVE_LOGIN_INTERVAL: Duration = Duration::from_secs(60);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -111,6 +113,10 @@ async fn serve() -> Result<()> {
     if tokio::time::timeout(STOP_TIMEOUT, supervisor).await.is_err() {
         log::warn!("the session didn't end in time");
     }
+    // A renewed login only in memory would be lost with the process.
+    if daemon.save_login().await.is_some() {
+        log::error!("the renewed login couldn't be saved; you may need to log in again");
+    }
     queue::clear();
     let _ = std::fs::remove_file(&path);
     Ok(())
@@ -123,6 +129,9 @@ pub struct Daemon {
     reconnect: Notify,
     /// Set when the service stops: the session ends and no new one starts.
     stopping: AtomicBool,
+    /// A renewed login the keyring wouldn't take yet; saved on the next attempt.
+    /// Spotify may stop accepting the old one once it hands out a new one.
+    unsaved_login: Mutex<Option<String>>,
     slot: SpircSlot,
     http: reqwest::Client,
 }
@@ -134,9 +143,44 @@ impl Daemon {
             events: broadcast::channel(EVENT_BACKLOG).0,
             reconnect: Notify::new(),
             stopping: AtomicBool::new(false),
+            unsaved_login: Mutex::new(None),
             slot,
             http: spotify::http(),
         }
+    }
+
+    fn unsaved_login(&self) -> MutexGuard<'_, Option<String>> {
+        self.unsaved_login
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Tries again to save a renewed login the keyring refused; returns it if
+    /// it is still unsaved.
+    async fn save_login(&self) -> Option<String> {
+        let token = self.unsaved_login().clone()?;
+        match spotify::store_refresh_token(&token).await {
+            Ok(()) => {
+                log::info!("saved the renewed login to the keyring");
+                let mut unsaved = self.unsaved_login();
+                if unsaved.as_deref() == Some(token.as_str()) {
+                    *unsaved = None;
+                }
+                None
+            }
+            Err(error) => {
+                log::warn!("still cannot save the renewed login: {error}");
+                Some(token)
+            }
+        }
+    }
+
+    /// The login to use: one still waiting to be saved, else the keyring's.
+    async fn login(&self) -> std::result::Result<Option<String>, spotify::Error> {
+        if let Some(token) = self.save_login().await {
+            return Ok(Some(token));
+        }
+        spotify::stored_refresh_token().await
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -285,11 +329,14 @@ impl Daemon {
                 Ok(Response::Done)
             }
             Request::Reconnect => {
+                // A window just stored a fresh login; it replaces any unsaved one.
+                *self.unsaved_login() = None;
                 self.reconnect.notify_one();
                 Ok(Response::Done)
             }
             Request::Logout => {
-                spotify::forget().map_err(text)?;
+                *self.unsaved_login() = None;
+                spotify::forget().await.map_err(text)?;
                 self.reconnect.notify_one();
                 Ok(Response::Done)
             }
@@ -384,6 +431,8 @@ fn failure(error: &spotify::Error) -> Failure {
         spotify::Error::Network(error) if error.status().is_some_and(|s| s.as_u16() == 429) => {
             Kind::RateLimited
         }
+        spotify::Error::Accounts(429) => Kind::RateLimited,
+        spotify::Error::Accounts(_) => Kind::Network,
         spotify::Error::Network(_) | spotify::Error::Lrclib(_) | spotify::Error::Timeout(_) => {
             Kind::Network
         }
@@ -405,7 +454,7 @@ fn failure(error: &spotify::Error) -> Failure {
 async fn supervise(daemon: Arc<Daemon>, mpris: Option<Arc<Mpris>>) {
     let mut failures = 0;
     while !daemon.stopping.load(Ordering::SeqCst) {
-        let refresh_token = match spotify::stored_refresh_token() {
+        let refresh_token = match daemon.login().await {
             Ok(Some(token)) => token,
             Ok(None) => {
                 daemon.set_status(Status::LoggedOut);
@@ -428,6 +477,20 @@ async fn supervise(daemon: Arc<Daemon>, mpris: Option<Arc<Mpris>>) {
                     return;
                 }
                 tokio::time::sleep(RECONNECT_DELAY).await;
+            }
+            Err(spotify::Error::Unauthorized)
+                if matches!(
+                    spotify::stored_refresh_token().await,
+                    Ok(Some(stored)) if stored != refresh_token
+                ) =>
+            {
+                // Another spotitui (a window logging in, a test) renewed the login
+                // meanwhile, and Spotify retired the one read before. Use the new one.
+                log::info!("the login was renewed elsewhere; trying it");
+                let mut unsaved = daemon.unsaved_login();
+                if unsaved.as_deref() == Some(refresh_token.as_str()) {
+                    *unsaved = None;
+                }
             }
             Err(error) => {
                 log::warn!("cannot connect to Spotify: {error}");
@@ -453,7 +516,13 @@ async fn connect(
     refresh_token: &str,
 ) -> std::result::Result<Connection, spotify::Error> {
     let token = Token::refresh(&daemon.http, refresh_token).await?;
-    token.store()?;
+    if token.refresh_token() != refresh_token
+        && let Err(error) = token.store().await
+    {
+        // Keep going with the session; the login is saved on the next attempt.
+        log::warn!("cannot save the renewed login, keeping it for now: {error}");
+        *daemon.unsaved_login() = Some(token.refresh_token().to_owned());
+    }
     let volume = daemon.state().player.volume;
     Speaker::connect(token.access, volume).await
 }
@@ -491,8 +560,13 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
         }
     });
 
+    let mut save_login = tokio::time::interval(SAVE_LOGIN_INTERVAL);
+    save_login.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let session_ended = loop {
         tokio::select! {
+            _ = save_login.tick() => {
+                daemon.save_login().await;
+            }
             event = events.recv() => match event {
                 Some(event) => daemon.on_player_event(event, mpris).await,
                 None => break false,

@@ -171,6 +171,7 @@ cargo run -- daemon             # a service in the foreground (stop the systemd 
 cargo run                       # a window; it uses whichever service is running
 SPOTITUI_LOG=/tmp/spotitui.log SPOTITUI_LOG_LEVEL=debug cargo run
 cargo test                      # unit tests
+cargo test live_cluster -- --ignored --nocapture   # Spotify's device list, as it sees it
 cargo test -- --ignored         # plus live tests: an LRCLIB lookup, and library tests
                                 # that like/unlike a track and add/remove one in a playlist
                                 # (they undo what they do; they need a stored login)
@@ -188,6 +189,11 @@ library writes, the queue observer),
 `src/app/` holds state and input, `src/ui/` draws, `src/theme.rs` reads the
 Omarchy theme. Background work reports back to the main loop as `Msg`s, so all
 state changes happen in one place.
+
+Spotify retires a refresh token once it hands out a new one, and every refresh
+(the service connecting, a live test) may do so: a copy of an older login from the
+keyring stops working. The service keeps a renewed login in memory if the keyring
+won't take it, and retries saving it every minute and when stopping.
 
 Library browsing and changes use Spotify's internal, undocumented services (the same ones
 the official apps use), so a Spotify-side change can break it until librespot

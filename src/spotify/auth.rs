@@ -2,7 +2,7 @@
 //!
 //! Adapted from fusor-rs/spotify-tui (MIT).
 
-use super::Error;
+use super::{Error, secrets};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::{Rng, distr::Alphanumeric};
 use reqwest::Url;
@@ -24,8 +24,6 @@ const SCOPES: &str = "streaming user-read-private playlist-read-private \
 const VERIFIER_LENGTH: usize = 64;
 const STATE_LENGTH: usize = 16;
 const MAX_REQUEST_BYTES: usize = 8192;
-const KEYRING_SERVICE: &str = "spotitui";
-const KEYRING_ACCOUNT: &str = "refresh-token";
 
 pub struct Authorization {
     pub url: String,
@@ -144,8 +142,8 @@ impl Token {
         previous_refresh: Option<&str>,
     ) -> Result<Self, Error> {
         let response = http.post(TOKEN_URL).form(form).send().await?;
-        if !response.status().is_success() {
-            return Err(Error::Unauthorized);
+        if let Some(error) = refusal(response.status()) {
+            return Err(error);
         }
         let token: TokenResponse = response.json().await?;
         let refresh = token
@@ -158,31 +156,37 @@ impl Token {
         })
     }
 
-    pub fn store(&self) -> Result<(), Error> {
-        keyring_entry()?.set_password(&self.refresh)?;
-        Ok(())
+    /// The refresh token to keep: Spotify may hand out a new one with each refresh.
+    pub fn refresh_token(&self) -> &str {
+        &self.refresh
+    }
+
+    pub async fn store(&self) -> Result<(), Error> {
+        secrets::store(&self.refresh).await
     }
 }
 
-pub fn stored_refresh_token() -> Result<Option<String>, Error> {
-    match keyring_entry()?.get_password() {
-        Ok(token) => Ok(Some(token)),
-        // Not being logged in yet is the expected first-run state.
-        Err(keyring::Error::NoEntry) => Ok(None),
-        Err(error) => Err(error.into()),
+/// What a failed answer from the login service means. Only a refused login
+/// (400 `invalid_grant`, 401) needs the user; anything else is Spotify having
+/// trouble, and trying again later may work.
+fn refusal(status: reqwest::StatusCode) -> Option<Error> {
+    match status.as_u16() {
+        200..=299 => None,
+        400 | 401 => Some(Error::Unauthorized),
+        code => Some(Error::Accounts(code)),
     }
 }
 
-pub fn forget() -> Result<(), Error> {
-    match keyring_entry()?.delete_credential() {
-        // Logging out twice leaves the intended state.
-        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
-        Err(error) => Err(error.into()),
-    }
+pub async fn store_refresh_token(token: &str) -> Result<(), Error> {
+    secrets::store(token).await
 }
 
-fn keyring_entry() -> keyring::Result<keyring::Entry> {
-    keyring::Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
+pub async fn stored_refresh_token() -> Result<Option<String>, Error> {
+    secrets::load().await
+}
+
+pub async fn forget() -> Result<(), Error> {
+    secrets::forget().await
 }
 
 fn redirect_uri() -> String {
@@ -233,4 +237,25 @@ async fn respond(stream: &mut TcpStream, page: &str) -> Result<(), Error> {
     );
     stream.write_all(response.as_bytes()).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Error, refusal};
+    use reqwest::StatusCode;
+
+    #[test]
+    fn only_a_refused_login_needs_the_user() {
+        assert!(refusal(StatusCode::OK).is_none());
+        assert!(matches!(refusal(StatusCode::BAD_REQUEST), Some(Error::Unauthorized)));
+        assert!(matches!(refusal(StatusCode::UNAUTHORIZED), Some(Error::Unauthorized)));
+        assert!(matches!(
+            refusal(StatusCode::TOO_MANY_REQUESTS),
+            Some(Error::Accounts(429))
+        ));
+        assert!(matches!(
+            refusal(StatusCode::SERVICE_UNAVAILABLE),
+            Some(Error::Accounts(503))
+        ));
+    }
 }

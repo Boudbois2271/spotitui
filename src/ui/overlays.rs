@@ -73,7 +73,7 @@ pub fn welcome(frame: &mut Frame, app: &mut App, area: Rect) {
         None,
     ));
     lines.push((Line::raw(""), None));
-    if matches!(app.screen, Screen::LoggedOut | Screen::Failed(_)) {
+    if app.needs_login() {
         let style = Style::new()
             .fg(theme.on_accent)
             .bg(theme.accent)
@@ -96,7 +96,14 @@ pub fn welcome(frame: &mut Frame, app: &mut App, area: Rect) {
             "Approve spotitui in your browser. This screen continues by itself.".to_owned(),
             Style::new().fg(theme.subtext),
         ),
-        Screen::Failed(error) => (error.message.clone(), Style::new().fg(theme.error)),
+        Screen::Failed(error) if app.needs_login() => {
+            (error.message.clone(), Style::new().fg(theme.error))
+        }
+        // The service keeps trying by itself; say so rather than ask for a login.
+        Screen::Failed(error) => (
+            format!("{} spotitui keeps trying by itself.", error.message),
+            Style::new().fg(theme.error),
+        ),
         Screen::Library => (String::new(), Style::new()),
     };
     for row in wrap(&status, width.into()) {

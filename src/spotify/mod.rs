@@ -10,9 +10,10 @@ mod lyrics;
 mod model;
 pub mod mpris;
 pub mod queue;
+mod secrets;
 mod speaker;
 
-pub use auth::{Authorization, Token, forget, stored_refresh_token};
+pub use auth::{Authorization, Token, forget, store_refresh_token, stored_refresh_token};
 pub use catalog::{Catalog, search_uri};
 pub use lyrics::Lyrics;
 pub use model::{Album, Artist, NowTrack, Playlist, Repeat, Track};
@@ -93,7 +94,9 @@ pub enum Error {
     #[error("Login failed while talking to the browser: {0}")]
     Browser(#[from] std::io::Error),
     #[error("Cannot use the system keyring for your login ({0})")]
-    Keyring(#[from] keyring::Error),
+    Keyring(#[from] secret_service::Error),
+    #[error("Spotify's login service is having trouble (HTTP {0}); trying again")]
+    Accounts(u16),
     #[error("No audio output is available on this computer")]
     NoAudio,
     #[error("Spotify didn't answer in time ({0})")]

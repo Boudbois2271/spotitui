@@ -10,12 +10,13 @@ use protobuf::Message;
 
 async fn catalog() -> Catalog {
     let refresh = stored_refresh_token()
+        .await
         .expect("keyring readable")
         .expect("logged in");
     let token = Token::refresh(&reqwest::Client::new(), &refresh)
         .await
         .expect("token refreshes");
-    token.store().expect("token stored");
+    token.store().await.expect("token stored");
     let session = Session::new(SessionConfig::default(), None);
     session
         .connect(Credentials::with_access_token(token.access), false)
@@ -173,12 +174,13 @@ async fn live_undo() {
 #[ignore = "talks to Spotify"]
 async fn live_cluster() {
     let refresh = stored_refresh_token()
+        .await
         .expect("keyring readable")
         .expect("logged in");
     let token = Token::refresh(&reqwest::Client::new(), &refresh)
         .await
         .expect("token refreshes");
-    token.store().expect("token stored");
+    token.store().await.expect("token stored");
     let config = SessionConfig {
         device_id: format!("hobs_{}", super::device_id("live test", 32)),
         ..SessionConfig::default()
