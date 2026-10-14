@@ -348,7 +348,7 @@ impl App {
         match snapshot.track {
             Some(track) if self.now.uri() != Some(track.uri.as_str()) => self.track_changed(track),
             Some(_) => {}
-            None => self.now.track = None,
+            None => self.now.clear_track(),
         }
         self.now.report(snapshot.position_ms, snapshot.playing);
         self.now.volume = snapshot.volume;
@@ -403,10 +403,10 @@ impl App {
             PlayerUpdate::Paused { position_ms } => self.now.report(position_ms, false),
             PlayerUpdate::Seeked { position_ms } => self.now.seeked(position_ms),
             PlayerUpdate::Position { position_ms } => {
-                let playing = self.now.playing;
+                let playing = self.now.playing();
                 self.now.report(position_ms, playing);
             }
-            PlayerUpdate::Stopped => self.now.playing = false,
+            PlayerUpdate::Stopped => self.now.stop(),
             PlayerUpdate::Volume(volume) => self.now.report_volume(volume),
             PlayerUpdate::Muted(muted) => self.now.muted = muted,
             PlayerUpdate::Shuffle(shuffle) => self.now.shuffle = shuffle,
@@ -882,7 +882,7 @@ impl App {
     fn toggle_play(&mut self) {
         if self.now.track.is_none() {
             self.play_selected();
-        } else if self.now.playing {
+        } else if self.now.playing() {
             self.command(Command::Pause);
         } else {
             self.command(Command::Resume);

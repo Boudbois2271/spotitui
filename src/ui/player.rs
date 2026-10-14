@@ -74,7 +74,7 @@ fn controls(app: &App) -> Vec<(String, Action, Style)> {
     let theme = app.theme;
     let plain = Style::new().fg(theme.subtext);
     let on = Style::new().fg(theme.accent);
-    let play = if app.now.playing {
+    let play = if app.now.playing() {
         "‖ Pause"
     } else {
         "▶ Play"

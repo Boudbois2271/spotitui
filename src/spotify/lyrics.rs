@@ -278,6 +278,7 @@ mod tests {
             name: "Harder, Better, Faster, Stronger".into(),
             artists: vec!["Daft Punk".into()],
             album: "Discovery".into(),
+            album_artists: vec!["Daft Punk".into()],
             duration_ms: 224_000,
             art_url: None,
         };

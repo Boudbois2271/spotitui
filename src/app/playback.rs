@@ -1,6 +1,6 @@
 //! What the speaker reports it is playing.
 
-use crate::spotify::{NowTrack, Repeat};
+use crate::spotify::{NowTrack, Repeat, playing::Clock};
 use std::time::{Duration, Instant};
 
 const DEFAULT_VOLUME: u16 = u16::MAX / 2;
@@ -34,9 +34,8 @@ impl Seeking {
 #[derive(Clone, Debug)]
 pub struct NowPlaying {
     pub track: Option<NowTrack>,
-    pub playing: bool,
-    position: Duration,
-    reported: Instant,
+    /// The position, as the service keeps it, moved on here between reports.
+    clock: Clock,
     pub volume: u16,
     /// Muted output; the volume keeps its level underneath.
     pub muted: bool,
@@ -54,9 +53,7 @@ impl Default for NowPlaying {
     fn default() -> Self {
         Self {
             track: None,
-            playing: false,
-            position: Duration::ZERO,
-            reported: Instant::now(),
+            clock: Clock::default(),
             volume: DEFAULT_VOLUME,
             muted: false,
             shuffle: false,
@@ -77,19 +74,28 @@ impl NowPlaying {
         }
     }
 
+    pub fn playing(&self) -> bool {
+        self.clock.running()
+    }
+
     /// Takes a position the speaker reports. While seeks are on their way, reports of
     /// earlier positions are stale and only the playing state is taken.
     pub fn report(&mut self, position_ms: u32, playing: bool) {
         if let Some(seeking) = self.seeking {
             if !seeking.reached(position_ms) && !seeking.settled() {
-                self.set_playing(playing);
+                self.clock.set_running(playing);
                 return;
             }
             self.seeking = None;
         }
-        self.position = Duration::from_millis(position_ms.into());
-        self.reported = Instant::now();
-        self.playing = playing;
+        self.clock
+            .report(Duration::from_millis(position_ms.into()), playing);
+    }
+
+    /// The speaker stopped (another device took over, or the list ended): the
+    /// track stays, stopped where it got to.
+    pub fn stop(&mut self) {
+        self.clock.set_running(false);
     }
 
     /// The speaker finished one seek.
@@ -98,14 +104,15 @@ impl NowPlaying {
             seeking.pending = seeking.pending.saturating_sub(1);
             seeking.activity = Instant::now();
         }
-        let playing = self.playing;
+        let playing = self.playing();
         self.report(position_ms, playing);
     }
 
     /// Moves to `position_ms` right away, ahead of the speaker's report.
     pub fn seek(&mut self, position_ms: u32) {
-        self.position = Duration::from_millis(position_ms.into());
-        self.reported = Instant::now();
+        let playing = self.playing();
+        self.clock
+            .report(Duration::from_millis(position_ms.into()), playing);
         let pending = self.seeking.map_or(0, |seeking| seeking.pending);
         self.seeking = Some(Seeking {
             target: position_ms,
@@ -147,20 +154,16 @@ impl NowPlaying {
         self.volume = self.held_volume.take().unwrap_or(target);
     }
 
-    fn set_playing(&mut self, playing: bool) {
-        if playing != self.playing {
-            // Pausing or resuming keeps the position reached so far.
-            self.position = self.elapsed();
-            self.reported = Instant::now();
-            self.playing = playing;
-        }
-    }
-
     pub fn change_track(&mut self, track: NowTrack) {
+        self.clock
+            .restart(Duration::from_millis(track.duration_ms));
         self.track = Some(track);
         self.seeking = None;
-        self.position = Duration::ZERO;
-        self.reported = Instant::now();
+    }
+
+    pub fn clear_track(&mut self) {
+        self.track = None;
+        self.clock.restart(Duration::ZERO);
     }
 
     pub fn uri(&self) -> Option<&str> {
@@ -174,16 +177,7 @@ impl NowPlaying {
     }
 
     pub fn elapsed(&self) -> Duration {
-        let since = if self.playing {
-            self.reported.elapsed()
-        } else {
-            Duration::ZERO
-        };
-        let elapsed = self.position + since;
-        match self.track {
-            Some(_) => elapsed.min(self.length()),
-            None => elapsed,
-        }
+        self.clock.elapsed()
     }
 
     pub fn elapsed_ms(&self) -> u64 {
@@ -286,6 +280,25 @@ mod tests {
         assert_eq!(now.volume_percent(), 35);
         now.report_volume(asked[2]);
         assert_eq!(now.volume_percent(), 35);
+    }
+
+    #[test]
+    fn stopping_freezes_the_position_where_it_got_to() {
+        let mut now = NowPlaying::default();
+        now.change_track(crate::spotify::NowTrack {
+            uri: "spotify:track:x".into(),
+            name: "x".into(),
+            artists: Vec::new(),
+            album: String::new(),
+            album_artists: Vec::new(),
+            duration_ms: 300_000,
+            art_url: None,
+        });
+        now.report(60_000, true);
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        now.stop();
+        assert!(!now.playing());
+        assert!(now.elapsed_ms() >= 60_030, "not back at the last report");
     }
 
     #[test]

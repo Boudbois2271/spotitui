@@ -29,6 +29,9 @@ pub struct NowTrack {
     pub name: String,
     pub artists: Vec<String>,
     pub album: String,
+    /// For MPRIS; absent from services older than it.
+    #[serde(default)]
+    pub album_artists: Vec<String>,
     pub duration_ms: u64,
     pub art_url: Option<String>,
 }

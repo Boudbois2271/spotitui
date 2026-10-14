@@ -9,6 +9,7 @@ mod live_tests;
 mod lyrics;
 mod model;
 pub mod mpris;
+pub mod playing;
 pub mod queue;
 mod secrets;
 mod speaker;
@@ -18,7 +19,7 @@ pub use catalog::{Catalog, search_uri};
 pub use library::Liked;
 pub use lyrics::Lyrics;
 pub use model::{Album, Artist, NowTrack, Playlist, Repeat, Track};
-pub use speaker::{Command, Connection, DEVICE_NAME, Mode, Play, Speaker, now_track};
+pub use speaker::{Command, Connection, DEVICE_NAME, Mode, Play, Speaker};
 
 use std::time::Duration;
 

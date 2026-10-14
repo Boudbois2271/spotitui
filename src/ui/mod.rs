@@ -119,7 +119,7 @@ fn notice_line(frame: &mut Frame, app: &App, area: Rect) {
 
 /// Four bars that dance while music plays.
 fn equalizer(app: &App) -> String {
-    if !app.now.playing {
+    if !app.now.playing() {
         return EQUALIZER_LEVELS[0].to_string().repeat(4);
     }
     let tick = app.ticks as usize;

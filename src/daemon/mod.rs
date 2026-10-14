@@ -69,7 +69,9 @@ async fn serve() -> Result<()> {
         return Ok(());
     };
     let slot = SpircSlot::default();
-    let mpris = match mpris::serve(slot.clone()).await {
+    // What plays: the service's state and MPRIS read this one record.
+    let playing = spotify::playing::shared(state::saved_volume());
+    let mpris = match mpris::serve(slot.clone(), playing.clone()).await {
         Ok(mpris) => Some(Arc::new(mpris)),
         // Without a session bus the player still works, just without media keys.
         Err(error) => {
@@ -77,7 +79,7 @@ async fn serve() -> Result<()> {
             None
         }
     };
-    let daemon = Arc::new(Daemon::new(slot));
+    let daemon = Arc::new(Daemon::new(slot, playing));
     log::info!("spotitui service listening on {}", path.display());
     let mut supervisor = tokio::spawn(supervise(daemon.clone(), mpris));
     let mut acceptor = tokio::spawn(server::accept(daemon.clone(), listener));
@@ -139,9 +141,9 @@ pub struct Daemon {
 }
 
 impl Daemon {
-    fn new(slot: SpircSlot) -> Self {
+    fn new(slot: SpircSlot, playing: spotify::playing::Shared) -> Self {
         Self {
-            state: Mutex::new(State::new()),
+            state: Mutex::new(State::new(playing)),
             events: broadcast::channel(EVENT_BACKLOG).0,
             reconnect: Notify::new(),
             stopping: AtomicBool::new(false),
@@ -276,7 +278,7 @@ impl Daemon {
                 // older one would bring back the previous list's tracks.
                 let queue = {
                     let state = self.state();
-                    let playing = state.player.track.as_ref().map(|track| track.uri.clone());
+                    let playing = state.playing().track.as_ref().map(|track| track.uri.clone());
                     state
                         .live_queue
                         .clone()
@@ -392,7 +394,7 @@ impl Daemon {
             // The speaker is active once it plays; a volume it ignored before applies now.
             let resend = match (&update, state.wanted_volume) {
                 (Some(PlayerUpdate::Playing { .. }), Some(volume))
-                    if volume != state.player.volume =>
+                    if volume != state.playing().volume =>
                 {
                     Some(volume)
                 }
@@ -406,10 +408,10 @@ impl Daemon {
         {
             log::warn!("cannot set the volume: {error}");
         }
-        if let Some(mpris) = mpris {
-            mpris.apply(event).await;
-        }
         if let Some(update) = update {
+            if let Some(mpris) = mpris {
+                mpris.changed(&update).await;
+            }
             self.broadcast(Event::Player(update));
         }
     }
@@ -547,7 +549,7 @@ async fn connect(
         log::warn!("cannot save the renewed login, keeping it for now: {error}");
         *daemon.unsaved_login() = Some(token.refresh_token().to_owned());
     }
-    let volume = daemon.state().player.volume;
+    let volume = daemon.state().playing().volume;
     Speaker::connect(token.access, volume).await
 }
 
@@ -621,7 +623,7 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
     }
     queue::clear();
     if let Some(mpris) = mpris {
-        mpris.reset().await;
+        mpris.refresh().await;
     }
     daemon.set_status(Status::Connecting);
     let snapshot = daemon.snapshot();

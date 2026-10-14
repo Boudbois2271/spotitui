@@ -1,16 +1,17 @@
 //! Publishes the speaker on the session bus as an MPRIS player, so `playerctl`,
-//! media keys and the Omarchy shell can control it.
+//! media keys and the Omarchy shell can control it. It reads what plays from
+//! the service's own record ([`playing::Shared`]); the service says when a
+//! property changed.
 //!
 //! Adapted from fusor-rs/spotify-tui (MIT).
 
-use super::DEVICE_NAME;
+use super::{DEVICE_NAME, NowTrack, Repeat, playing};
+use crate::protocol::PlayerUpdate;
 use librespot_connect::Spirc;
-use librespot_metadata::audio::{AudioItem, UniqueFields};
-use librespot_playback::player::PlayerEvent;
 use std::{
     collections::HashMap,
     sync::{Arc, RwLock},
-    time::{Duration, Instant},
+    time::Duration,
 };
 use zbus::{
     Connection, connection,
@@ -31,7 +32,7 @@ const MAX_SKIP: u32 = 20;
 /// life and points it at each new Spirc as it reconnects; `None` between sessions.
 pub type SpircSlot = Arc<RwLock<Option<Arc<Spirc>>>>;
 
-/// A published MPRIS player, fed with the speaker's events.
+/// A published MPRIS player.
 pub struct Mpris {
     player: InterfaceRef<Player>,
     http: reqwest::Client,
@@ -39,14 +40,15 @@ pub struct Mpris {
 }
 
 /// Publishes the MPRIS player on the session bus.
-pub async fn serve(slot: SpircSlot) -> zbus::Result<Mpris> {
+pub async fn serve(slot: SpircSlot, playing: playing::Shared) -> zbus::Result<Mpris> {
     let connection = connection::Builder::session()?
         .serve_at(PATH, Root)?
         .serve_at(
             PATH,
             Player {
                 slot: slot.clone(),
-                now: Now::default(),
+                playing,
+                art: None,
             },
         )?
         .serve_at(PATH, Queue { slot })?
@@ -74,39 +76,56 @@ pub async fn serve(slot: SpircSlot) -> zbus::Result<Mpris> {
 }
 
 impl Mpris {
-    /// Takes one speaker event and tells MPRIS clients what changed.
-    pub async fn apply(&self, event: PlayerEvent) {
-        let change = self.player.get_mut().await.now.apply(event);
-        if change == Change::Track {
-            let track = self.player.get().await.now.track.clone();
-            if let Some(track) = track {
-                tokio::spawn(publish_cover(self.player.clone(), self.http.clone(), track));
+    /// Tells MPRIS clients what an update of the shared record changed.
+    pub async fn changed(&self, update: &PlayerUpdate) {
+        let change = match update {
+            PlayerUpdate::Track(track) => {
+                self.player.get_mut().await.art = None;
+                tokio::spawn(publish_cover(
+                    self.player.clone(),
+                    self.http.clone(),
+                    track.clone(),
+                ));
+                Change::Track
             }
-        }
+            PlayerUpdate::Playing { .. } | PlayerUpdate::Paused { .. } | PlayerUpdate::Stopped => {
+                Change::Status
+            }
+            PlayerUpdate::Seeked { .. } | PlayerUpdate::Position { .. } => Change::Position,
+            PlayerUpdate::Volume(_) => Change::Volume,
+            PlayerUpdate::Shuffle(_) => Change::Shuffle,
+            PlayerUpdate::Repeat(_) => Change::Loop,
+            PlayerUpdate::Muted(_) | PlayerUpdate::Unavailable => return,
+        };
         // A listener that misses one update catches up on the next.
         let _ = announce(&self.player, change).await;
     }
 
-    /// Forgets the track after the session ended, so clients show nothing playing.
-    pub async fn reset(&self) {
-        let volume = self.player.get().await.now.volume;
-        self.player.get_mut().await.now = Now {
-            volume,
-            ..Now::default()
-        };
-        let _ = announce(&self.player, Change::Track).await;
-        let _ = announce(&self.player, Change::Status).await;
+    /// Announces everything again, as after the session ended and the record
+    /// was cleared: clients show nothing playing.
+    pub async fn refresh(&self) {
+        self.player.get_mut().await.art = None;
+        for change in [
+            Change::Track,
+            Change::Status,
+            Change::Volume,
+            Change::Shuffle,
+            Change::Loop,
+        ] {
+            let _ = announce(&self.player, change).await;
+        }
     }
 }
 
 /// Downloads the track's cover to `$XDG_RUNTIME_DIR/spotitui/covers/` and
 /// publishes it as a `file://` URL. Files are named after Spotify's image ID,
 /// so the tracks of an album share one download.
-async fn publish_cover(player: InterfaceRef<Player>, http: reqwest::Client, track: Track) {
-    let (Some(remote), Some(dir)) = (track.remote_art.clone(), covers_dir()) else {
+async fn publish_cover(player: InterfaceRef<Player>, http: reqwest::Client, track: NowTrack) {
+    let (Some(remote), Some(dir)) = (track.art_url.clone(), covers_dir()) else {
         return;
     };
-    let path = dir.join(format!("{}.jpg", cover_name(&remote, &track.id)));
+    let id = track_id(&track.uri);
+    let path = dir.join(format!("{}.jpg", cover_name(&remote, id)));
     if !path.exists() {
         let Ok(bytes) = async {
             http.get(&remote)
@@ -124,7 +143,7 @@ async fn publish_cover(player: InterfaceRef<Player>, http: reqwest::Client, trac
             return;
         }
         // Named per track: two tracks of an album may download the same image at once.
-        let partial = dir.join(format!("{}.partial", track.id));
+        let partial = dir.join(format!("{id}.partial"));
         if std::fs::write(&partial, &bytes).is_err() || std::fs::rename(&partial, &path).is_err() {
             let _ = std::fs::remove_file(&partial);
             return;
@@ -133,11 +152,15 @@ async fn publish_cover(player: InterfaceRef<Player>, http: reqwest::Client, trac
     let url = format!("file://{}", path.display());
     {
         let mut player = player.get_mut().await;
-        match &mut player.now.track {
-            Some(current) if current.id == track.id => current.art_url = Some(url),
-            // Another track started meanwhile; its own download publishes, and cleans up.
-            _ => return,
+        let current = playing::lock(&player.playing)
+            .track
+            .as_ref()
+            .is_some_and(|playing| playing.uri == track.uri);
+        // Another track started meanwhile; its own download publishes, and cleans up.
+        if !current {
+            return;
         }
+        player.art = Some((track.uri.clone(), url));
     }
     let _ = announce(&player, Change::Track).await;
     prune_covers(&dir, &path, std::time::SystemTime::now());
@@ -189,7 +212,6 @@ async fn announce(player: &InterfaceRef<Player>, change: Change) -> zbus::Result
     let emitter = player.signal_emitter();
     let player = player.get().await;
     match change {
-        Change::Nothing => Ok(()),
         // Seeking becomes possible once there is a track; clients cache CanSeek.
         Change::Track => {
             player.metadata_changed(emitter).await?;
@@ -199,218 +221,66 @@ async fn announce(player: &InterfaceRef<Player>, change: Change) -> zbus::Result
         Change::Volume => player.volume_changed(emitter).await,
         Change::Shuffle => player.shuffle_changed(emitter).await,
         Change::Loop => player.loop_status_changed(emitter).await,
-        Change::Position(position) => Player::seeked(emitter, position).await,
-    }
-}
-
-/// The track details MPRIS clients show.
-#[derive(Clone, Debug, PartialEq)]
-struct Track {
-    id: String,
-    uri: String,
-    title: String,
-    artists: Vec<String>,
-    album: Option<String>,
-    album_artists: Vec<String>,
-    length: Duration,
-    /// Spotify's cover image, not published: some MPRIS clients (Quickshell)
-    /// crashed fetching https covers. `art_url` is a local copy once downloaded.
-    remote_art: Option<String>,
-    art_url: Option<String>,
-}
-
-impl Track {
-    fn from_item(item: &AudioItem) -> Self {
-        let (artists, album, album_artists) = match &item.unique_fields {
-            UniqueFields::Track {
-                artists,
-                album,
-                album_artists,
-                ..
-            } => (
-                artists.iter().map(|artist| artist.name.clone()).collect(),
-                Some(album.clone()),
-                album_artists.clone(),
-            ),
-            UniqueFields::Local {
-                artists,
-                album,
-                album_artists,
-                ..
-            } => (
-                artists.iter().cloned().collect(),
-                album.clone(),
-                album_artists.iter().cloned().collect(),
-            ),
-            UniqueFields::Episode { show_name, .. } => {
-                (Vec::new(), Some(show_name.clone()), Vec::new())
-            }
-        };
-        Self {
-            id: item.uri.rsplit(':').next().unwrap_or_default().to_owned(),
-            uri: item.uri.clone(),
-            title: item.name.clone(),
-            artists,
-            album,
-            album_artists,
-            length: Duration::from_millis(item.duration_ms.into()),
-            remote_art: item
-                .covers
-                .iter()
-                .max_by_key(|cover| cover.width)
-                .map(|cover| cover.url.clone()),
-            art_url: None,
+        Change::Position => {
+            let position = micros(playing::lock(&player.playing).clock.elapsed());
+            Player::seeked(emitter, position).await
         }
     }
-
-    /// An object path unique to the track; Spotify IDs are alphanumeric.
-    fn path(&self) -> String {
-        let id: String = self
-            .id
-            .chars()
-            .filter(char::is_ascii_alphanumeric)
-            .collect();
-        format!("{PATH}/track/{id}")
-    }
-
-    fn metadata(&self) -> Vec<(&'static str, Value<'_>)> {
-        let mut fields = vec![
-            (
-                "mpris:trackid",
-                Value::from(ObjectPath::try_from(self.path()).unwrap_or_else(|_| no_track())),
-            ),
-            ("mpris:length", Value::from(micros(self.length))),
-            ("xesam:title", Value::from(self.title.as_str())),
-            ("xesam:artist", Value::from(self.artists.clone())),
-            ("xesam:albumArtist", Value::from(self.album_artists.clone())),
-        ];
-        if let Some(album) = &self.album {
-            fields.push(("xesam:album", Value::from(album.as_str())));
-        }
-        if let Some(art_url) = &self.art_url {
-            fields.push(("mpris:artUrl", Value::from(art_url.as_str())));
-        }
-        if self.uri.starts_with("spotify:track:") {
-            fields.push(("xesam:url", Value::from(format!("{TRACK_URL}{}", self.id))));
-        }
-        fields
-    }
 }
 
-/// What the player reports, kept for clients that ask.
-#[derive(Debug)]
-struct Now {
-    track: Option<Track>,
-    status: Status,
-    position: Duration,
-    reported: Instant,
-    volume: u16,
-    shuffle: bool,
-    repeat: Loop,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Status {
-    Stopped,
-    Playing,
-    Paused,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-enum Loop {
-    Off,
-    Playlist,
-    Track,
-}
-
-/// Which property an event changed.
+/// Which property an update changed.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Change {
-    Nothing,
     Track,
     Status,
     Volume,
     Shuffle,
     Loop,
-    Position(i64),
+    Position,
 }
 
-impl Default for Now {
-    fn default() -> Self {
-        Self {
-            track: None,
-            status: Status::Stopped,
-            position: Duration::ZERO,
-            reported: Instant::now(),
-            volume: u16::MAX / 2,
-            shuffle: false,
-            repeat: Loop::Off,
-        }
-    }
+/// The base62 ID of a Spotify URI: its last part.
+fn track_id(uri: &str) -> &str {
+    uri.rsplit(':').next().unwrap_or_default()
 }
 
-impl Now {
-    fn apply(&mut self, event: PlayerEvent) -> Change {
-        match event {
-            PlayerEvent::TrackChanged { audio_item } => {
-                self.track = Some(Track::from_item(&audio_item));
-                self.report(0);
-                Change::Track
-            }
-            PlayerEvent::Playing { position_ms, .. } => self.play(Status::Playing, position_ms),
-            PlayerEvent::Paused { position_ms, .. } => self.play(Status::Paused, position_ms),
-            PlayerEvent::Stopped { .. } => self.play(Status::Stopped, 0),
-            PlayerEvent::Seeked { position_ms, .. }
-            | PlayerEvent::PositionCorrection { position_ms, .. } => {
-                self.report(position_ms);
-                Change::Position(micros(self.position))
-            }
-            PlayerEvent::PositionChanged { position_ms, .. } => {
-                self.report(position_ms);
-                Change::Nothing
-            }
-            PlayerEvent::VolumeChanged { volume } => {
-                self.volume = volume;
-                Change::Volume
-            }
-            PlayerEvent::ShuffleChanged { shuffle } => {
-                self.shuffle = shuffle;
-                Change::Shuffle
-            }
-            PlayerEvent::RepeatChanged { context, track } => {
-                self.repeat = match (context, track) {
-                    (_, true) => Loop::Track,
-                    (true, false) => Loop::Playlist,
-                    (false, false) => Loop::Off,
-                };
-                Change::Loop
-            }
-            _ => Change::Nothing,
-        }
-    }
+/// An object path unique to the track; Spotify IDs are alphanumeric.
+fn track_path(uri: &str) -> String {
+    let id: String = track_id(uri)
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    format!("{PATH}/track/{id}")
+}
 
-    fn play(&mut self, status: Status, position_ms: u32) -> Change {
-        self.status = status;
-        self.report(position_ms);
-        Change::Status
+/// The MPRIS metadata of a track; `art` is its local cover, once downloaded.
+fn metadata(track: &NowTrack, art: Option<&str>) -> Vec<(&'static str, Value<'static>)> {
+    let path = ObjectPath::try_from(track_path(&track.uri)).unwrap_or_else(|_| no_track());
+    let mut fields = vec![
+        ("mpris:trackid", Value::from(path.into_owned())),
+        (
+            "mpris:length",
+            Value::from(micros(Duration::from_millis(track.duration_ms))),
+        ),
+        ("xesam:title", Value::from(track.name.clone())),
+        ("xesam:artist", Value::from(track.artists.clone())),
+        ("xesam:albumArtist", Value::from(track.album_artists.clone())),
+    ];
+    if !track.album.is_empty() {
+        fields.push(("xesam:album", Value::from(track.album.clone())));
     }
-
-    fn report(&mut self, position_ms: u32) {
-        self.position = Duration::from_millis(position_ms.into());
-        self.reported = Instant::now();
+    // Some MPRIS clients (Quickshell) crashed fetching https covers; only the
+    // local copy is published.
+    if let Some(art) = art {
+        fields.push(("mpris:artUrl", Value::from(art.to_owned())));
     }
-
-    fn elapsed(&self) -> Duration {
-        let since = match self.status {
-            Status::Playing => self.reported.elapsed(),
-            Status::Paused | Status::Stopped => Duration::ZERO,
-        };
-        let elapsed = self.position + since;
-        match &self.track {
-            Some(track) => elapsed.min(track.length),
-            None => elapsed,
-        }
+    if track.uri.starts_with("spotify:track:") {
+        fields.push((
+            "xesam:url",
+            Value::from(format!("{TRACK_URL}{}", track_id(&track.uri))),
+        ));
     }
+    fields
 }
 
 /// spotitui's own additions, beside the standard MPRIS interfaces.
@@ -489,7 +359,9 @@ impl Root {
 
 struct Player {
     slot: SpircSlot,
-    now: Now,
+    playing: playing::Shared,
+    /// The local cover file of a track, by URI.
+    art: Option<(String, String)>,
 }
 
 #[interface(name = "org.mpris.MediaPlayer2.Player")]
@@ -519,7 +391,8 @@ impl Player {
     }
 
     fn seek(&self, offset: i64) -> fdo::Result<()> {
-        let target = micros(self.now.elapsed()).saturating_add(offset).max(0);
+        let elapsed = playing::lock(&self.playing).clock.elapsed();
+        let target = micros(elapsed).saturating_add(offset).max(0);
         self.go_to(target)
     }
 
@@ -529,12 +402,11 @@ impl Player {
     )]
     fn set_position(&self, track_id: ObjectPath<'_>, position: i64) -> fdo::Result<()> {
         // MPRIS ignores positions for a track that is no longer playing, or out of range.
-        let current = self.now.track.as_ref().map(Track::path);
-        let length = self
-            .now
-            .track
-            .as_ref()
-            .map_or(0, |track| micros(track.length));
+        let (current, length) = {
+            let playing = playing::lock(&self.playing);
+            let current = playing.track.as_ref().map(|track| track_path(&track.uri));
+            (current, micros(playing.clock.length()))
+        };
         if current.as_deref() != Some(track_id.as_str()) || !(0..=length).contains(&position) {
             return Ok(());
         }
@@ -552,15 +424,15 @@ impl Player {
 
     #[zbus(property)]
     fn playback_status(&self) -> String {
-        format!("{:?}", self.now.status)
+        format!("{:?}", playing::lock(&self.playing).status)
     }
 
     #[zbus(property)]
     fn loop_status(&self) -> String {
-        match self.now.repeat {
-            Loop::Off => "None".into(),
-            Loop::Playlist => "Playlist".into(),
-            Loop::Track => "Track".into(),
+        match playing::lock(&self.playing).repeat {
+            Repeat::Off => "None".into(),
+            Repeat::Context => "Playlist".into(),
+            Repeat::Track => "Track".into(),
         }
     }
 
@@ -590,7 +462,7 @@ impl Player {
 
     #[zbus(property)]
     fn shuffle(&self) -> bool {
-        self.now.shuffle
+        playing::lock(&self.playing).shuffle
     }
 
     #[zbus(property)]
@@ -600,18 +472,24 @@ impl Player {
 
     #[zbus(property)]
     fn metadata(&self) -> HashMap<String, OwnedValue> {
-        let Some(track) = &self.now.track else {
+        let playing = playing::lock(&self.playing);
+        let Some(track) = &playing.track else {
             return [("mpris:trackid", Value::from(no_track()))]
                 .into_iter()
                 .filter_map(owned)
                 .collect();
         };
-        track.metadata().into_iter().filter_map(owned).collect()
+        let art = self
+            .art
+            .as_ref()
+            .filter(|(uri, _)| *uri == track.uri)
+            .map(|(_, url)| url.as_str());
+        metadata(track, art).into_iter().filter_map(owned).collect()
     }
 
     #[zbus(property)]
     fn volume(&self) -> f64 {
-        f64::from(self.now.volume) / f64::from(u16::MAX)
+        f64::from(playing::lock(&self.playing).volume) / f64::from(u16::MAX)
     }
 
     #[zbus(property)]
@@ -623,7 +501,7 @@ impl Player {
 
     #[zbus(property(emits_changed_signal = "false"))]
     fn position(&self) -> i64 {
-        micros(self.now.elapsed())
+        micros(playing::lock(&self.playing).clock.elapsed())
     }
 
     #[zbus(property)]
@@ -663,7 +541,7 @@ impl Player {
 
     #[zbus(property)]
     fn can_seek(&self) -> bool {
-        self.now.track.is_some()
+        playing::lock(&self.playing).track.is_some()
     }
 
     #[zbus(property(emits_changed_signal = "const"))]
@@ -714,20 +592,18 @@ fn failed(result: Result<(), librespot_core::Error>) -> fdo::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Change, Loop, Now, Status, Track, cover_name, prune_covers};
-    use librespot_playback::player::PlayerEvent;
+    use super::{cover_name, metadata, prune_covers, track_path};
+    use crate::spotify::NowTrack;
     use std::time::Duration;
 
-    fn track() -> Track {
-        Track {
-            id: "4uLU6hMCjMI75M1A2tKUQC".into(),
+    fn track() -> NowTrack {
+        NowTrack {
             uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".into(),
-            title: "Never Gonna Give You Up".into(),
+            name: "Never Gonna Give You Up".into(),
             artists: vec!["Rick Astley".into()],
-            album: Some("Whenever You Need Somebody".into()),
+            album: "Whenever You Need Somebody".into(),
             album_artists: vec!["Rick Astley".into()],
-            length: Duration::from_millis(213_573),
-            remote_art: None,
+            duration_ms: 213_573,
             art_url: None,
         }
     }
@@ -735,14 +611,18 @@ mod tests {
     #[test]
     fn tracks_have_valid_object_paths() {
         assert_eq!(
-            track().path(),
+            track_path(&track().uri),
             "/org/mpris/MediaPlayer2/track/4uLU6hMCjMI75M1A2tKUQC"
         );
         let track = track();
-        let metadata = track.metadata();
-        let keys: Vec<_> = metadata.iter().map(|(key, _)| *key).collect();
+        let keys: Vec<_> = metadata(&track, Some("file:///x.jpg"))
+            .iter()
+            .map(|(key, _)| *key)
+            .collect();
         assert!(keys.contains(&"mpris:trackid"));
         assert!(keys.contains(&"xesam:url"));
+        assert!(keys.contains(&"mpris:artUrl"));
+        assert!(!metadata(&track, None).iter().any(|(key, _)| *key == "mpris:artUrl"));
     }
 
     #[test]
@@ -777,33 +657,5 @@ mod tests {
         assert!(current.exists() && fresh.exists() && partial.exists());
         assert!(!old.exists());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn events_update_the_reported_state() {
-        let mut now = Now {
-            track: Some(track()),
-            ..Now::default()
-        };
-        let playing = PlayerEvent::Playing {
-            play_request_id: 0,
-            track_id: librespot_core::SpotifyUri::from_uri(&track().uri)
-                .expect("the test track URI is valid"),
-            position_ms: 1000,
-        };
-        assert_eq!(now.apply(playing), Change::Status);
-        assert_eq!(now.status, Status::Playing);
-        assert!(now.elapsed() >= Duration::from_secs(1));
-        let repeat = PlayerEvent::RepeatChanged {
-            context: true,
-            track: true,
-        };
-        assert_eq!(now.apply(repeat), Change::Loop);
-        assert_eq!(now.repeat, Loop::Track);
-        assert_eq!(
-            now.apply(PlayerEvent::VolumeChanged { volume: 7 }),
-            Change::Volume
-        );
-        assert_eq!(now.volume, 7);
     }
 }

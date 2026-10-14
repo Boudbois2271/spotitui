@@ -2,14 +2,13 @@
 //!
 //! Adapted from fusor-rs/spotify-tui (MIT).
 
-use super::{Catalog, Error, NowTrack, Repeat, bounded, catalog::run};
+use super::{Catalog, Error, Repeat, bounded, catalog::run};
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use librespot_connect::{
     ConnectConfig, LoadContextOptions, LoadRequest, LoadRequestOptions, Options, PlayingTrack,
     Spirc,
 };
 use librespot_core::{Session, SessionConfig, authentication::Credentials, config::DeviceType};
-use librespot_metadata::audio::{AudioItem, UniqueFields};
 use librespot_playback::{
     audio_backend,
     config::{AudioFormat, PlayerConfig},
@@ -126,10 +125,19 @@ pub enum Command {
 impl Speaker {
     /// Logs in and registers the speaker. Must run inside the Tokio runtime.
     pub async fn connect(access_token: String, initial_volume: u16) -> Result<Connection, Error> {
+        Self::connect_as(super::device_id("speaker", 40), access_token, initial_volume).await
+    }
+
+    /// Like [`Speaker::connect`], as another device (for tests).
+    pub async fn connect_as(
+        device_id: String,
+        access_token: String,
+        initial_volume: u16,
+    ) -> Result<Connection, Error> {
         bounded(
             CONNECT_TIMEOUT,
             "logging in",
-            start(access_token, initial_volume),
+            start(device_id, access_token, initial_volume),
         )
         .await
     }
@@ -204,40 +212,17 @@ impl Drop for Speaker {
     }
 }
 
-/// The now-playing details librespot reports with a track change.
-pub fn now_track(item: &AudioItem) -> NowTrack {
-    let (artists, album) = match &item.unique_fields {
-        UniqueFields::Track { artists, album, .. } => (
-            artists.0.iter().map(|artist| artist.name.clone()).collect(),
-            album.clone(),
-        ),
-        UniqueFields::Local { artists, album, .. } => (
-            artists.iter().cloned().collect(),
-            album.clone().unwrap_or_default(),
-        ),
-        UniqueFields::Episode { show_name, .. } => (Vec::new(), show_name.clone()),
-    };
-    NowTrack {
-        uri: item.uri.clone(),
-        name: item.name.clone(),
-        artists,
-        album,
-        duration_ms: item.duration_ms.into(),
-        art_url: item
-            .covers
-            .iter()
-            .max_by_key(|cover| cover.width)
-            .map(|cover| cover.url.clone()),
-    }
-}
-
-async fn start(access_token: String, initial_volume: u16) -> Result<Connection, Error> {
+async fn start(
+    device_id: String,
+    access_token: String,
+    initial_volume: u16,
+) -> Result<Connection, Error> {
     let backend = audio_backend::find(Some(PREFERRED_BACKEND.into()))
         .or_else(|| audio_backend::find(None))
         .ok_or(Error::NoAudio)?;
     let mixer = Arc::new(MuteMixer::open(MixerConfig::default())?);
     let config = SessionConfig {
-        device_id: super::device_id("speaker", 40),
+        device_id,
         ..SessionConfig::default()
     };
     let session = Session::new(config, None);
