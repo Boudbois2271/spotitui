@@ -38,6 +38,8 @@ pub struct State {
     /// Liked Songs, kept up to date through the collection's changes, so saving a
     /// track needs no full read to tell whether it is already there.
     pub liked: Option<spotify::Liked>,
+    /// When the speaker last reported tracks it couldn't play.
+    pub refusals: Vec<std::time::Instant>,
 }
 
 impl State {
@@ -52,6 +54,7 @@ impl State {
             live_queue: None,
             muted: saved_muted(),
             liked: None,
+            refusals: Vec::new(),
         }
     }
 
@@ -82,6 +85,7 @@ impl State {
         }
         self.live_queue = None;
         self.liked = None;
+        self.refusals.clear();
         self.live.take()
     }
 

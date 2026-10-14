@@ -23,7 +23,7 @@ use std::{
 };
 use tokio::{
     signal::unix::{SignalKind, signal},
-    sync::{Notify, broadcast, watch},
+    sync::{Notify, broadcast, mpsc, watch},
 };
 
 /// Waits between attempts to reach Spotify after failures, growing to the last.
@@ -45,6 +45,15 @@ const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 const SAVE_LOGIN_INTERVAL: Duration = Duration::from_secs(60);
 /// How often the session is checked for a lost connection.
 const SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
+/// Skips asked for within this of each other are made in one go.
+const SKIP_QUIET: Duration = Duration::from_millis(400);
+/// Skips keep being gathered for at most this long while presses go on.
+const SKIP_HOLD: Duration = Duration::from_millis(1200);
+/// How long a jump waits for the play queue to describe its target.
+const SKIP_QUEUE_WAIT: Duration = Duration::from_millis(1500);
+/// This many tracks refused within [`REFUSAL_WINDOW`] make windows say why.
+const REFUSAL_LIMIT: usize = 5;
+const REFUSAL_WINDOW: Duration = Duration::from_secs(30);
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 
@@ -73,7 +82,8 @@ async fn serve() -> Result<()> {
     let slot = SpircSlot::default();
     // What plays: the service's state and MPRIS read this one record.
     let playing = spotify::playing::shared(state::saved_volume());
-    let mpris = match mpris::serve(slot.clone(), playing.clone()).await {
+    let (skips, skip_requests) = mpsc::unbounded_channel();
+    let mpris = match mpris::serve(slot.clone(), playing.clone(), skips.clone()).await {
         Ok(mpris) => Some(Arc::new(mpris)),
         // Without a session bus the player still works, just without media keys.
         Err(error) => {
@@ -81,7 +91,8 @@ async fn serve() -> Result<()> {
             None
         }
     };
-    let daemon = Arc::new(Daemon::new(slot, playing));
+    let daemon = Arc::new(Daemon::new(slot, playing, skips));
+    tokio::spawn(gather_skips(daemon.clone(), skip_requests));
     log::info!("spotitui service listening on {}", path.display());
     let mut supervisor = tokio::spawn(supervise(daemon.clone(), mpris));
     let mut acceptor = tokio::spawn(server::accept(daemon.clone(), listener));
@@ -140,11 +151,18 @@ pub struct Daemon {
     unsaved_login: Mutex<Option<String>>,
     slot: SpircSlot,
     http: reqwest::Client,
+    /// Skips forward, from windows and MPRIS, gathered by [`gather_skips`].
+    skips: mpsc::UnboundedSender<u32>,
 }
 
 impl Daemon {
-    fn new(slot: SpircSlot, playing: spotify::playing::Shared) -> Self {
+    fn new(
+        slot: SpircSlot,
+        playing: spotify::playing::Shared,
+        skips: mpsc::UnboundedSender<u32>,
+    ) -> Self {
         Self {
+            skips,
             state: Mutex::new(State::new(playing)),
             events: broadcast::channel(EVENT_BACKLOG).0,
             reconnect: Notify::new(),
@@ -354,6 +372,12 @@ impl Daemon {
     }
 
     fn command(&self, command: Command) -> std::result::Result<Response, Failure> {
+        if command == Command::Next {
+            // Gathered with other quick skips; said at once if there's no speaker.
+            self.speaker()?;
+            let _ = self.skips.send(1);
+            return Ok(Response::Done);
+        }
         if let Command::Volume(volume) = command {
             // Kept for when the speaker becomes active, and for the next connection.
             self.state().wanted_volume = Some(volume);
@@ -368,6 +392,78 @@ impl Daemon {
             .command(command)
             .map_err(|error| failure(&error))?;
         Ok(Response::Done)
+    }
+
+    /// Skips `count` tracks forward now: one is librespot's own "next"; more
+    /// jump straight to the target track with a single load. Without a queue
+    /// that knows the target, it falls back to one "next" per track.
+    async fn skip_now(&self, count: u32) {
+        let Ok(speaker) = self.speaker() else {
+            return;
+        };
+        if count > 1 {
+            // Right after a jump the observer may not have heard of it yet; its
+            // queue then can't say what comes so far ahead. Give it a moment.
+            let mut target = self.skip_target(count);
+            let waited = tokio::time::Instant::now();
+            while target.is_none() && waited.elapsed() < SKIP_QUEUE_WAIT {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                target = self.skip_target(count);
+            }
+            if target.is_none() {
+                let state = self.state();
+                let playing = state.playing().track.as_ref().map(|track| track.uri.clone());
+                log::debug!(
+                    "no queue target {count} ahead of {playing:?}; queue: {:?}",
+                    state.live_queue.as_ref().map(|queue| (
+                        &queue.current_uri,
+                        queue.next.iter().take(6).map(|track| track.uri.as_str()).collect::<Vec<_>>()
+                    ))
+                );
+            }
+            if let Some((uri, uid)) = target {
+                log::debug!("skipping {count} tracks to {uri}");
+                match speaker.skip_to(uri, uid).await {
+                    Ok(()) => return,
+                    Err(error) => log::warn!("cannot skip ahead in one go: {error}"),
+                }
+            }
+        }
+        for _ in 0..count {
+            if let Err(error) = speaker.command(Command::Next) {
+                log::warn!("cannot skip: {error}");
+                return;
+            }
+        }
+    }
+
+    /// The URI and queue UID of the track `count` places ahead, if the play
+    /// queue knows it.
+    fn skip_target(&self, count: u32) -> Option<(String, String)> {
+        let state = self.state();
+        let playing = state.playing().track.as_ref()?.uri.clone();
+        let queue = state.live_queue.as_ref()?;
+        queue::skip_target(queue, &playing, count as usize)
+            .map(|track| (track.uri.clone(), track.uid.clone()))
+    }
+
+    /// Notes a track the speaker couldn't play; true once too many came in a
+    /// short while. When Spotify refuses decryption keys (for a minute or two
+    /// after many skips), librespot fails each track and moves on by itself,
+    /// asking for another key every time; nothing stops that short of a key
+    /// coming through, so windows are told what goes on.
+    fn refused(&self) -> bool {
+        let mut state = self.state();
+        let now = std::time::Instant::now();
+        state
+            .refusals
+            .retain(|at| now.duration_since(*at) < REFUSAL_WINDOW);
+        state.refusals.push(now);
+        if state.refusals.len() < REFUSAL_LIMIT {
+            return false;
+        }
+        state.refusals.clear();
+        true
     }
 
     /// Liked Songs as they are now: the kept set brought up to date with one
@@ -413,6 +509,10 @@ impl Daemon {
         {
             log::warn!("cannot set the volume: {error}");
         }
+        if matches!(update, Some(PlayerUpdate::Unavailable)) && self.refused() {
+            log::warn!("Spotify refused {REFUSAL_LIMIT} tracks within {REFUSAL_WINDOW:?}");
+            self.broadcast(Event::Player(PlayerUpdate::Refusing));
+        }
         if let Some(update) = update {
             if let Some(mpris) = mpris {
                 mpris.changed(&update).await;
@@ -429,6 +529,34 @@ impl Daemon {
             state.context_name(&around.context_uri, &around.context_name)
         };
         queue::write(&name, &around.tracks);
+    }
+}
+
+/// Makes skips forward, gathering presses that come in quick succession: the
+/// first one goes at once, the rest are added up until they stop for a moment
+/// and made as one jump. Spamming "next" used to load every track on the way,
+/// each asking Spotify for a decryption key, until Spotify refused them.
+async fn gather_skips(daemon: Arc<Daemon>, mut requests: mpsc::UnboundedReceiver<u32>) {
+    while let Some(first) = requests.recv().await {
+        daemon.skip_now(first).await;
+        let mut pending: u32 = 0;
+        let held = tokio::time::Instant::now();
+        loop {
+            let quiet = tokio::time::Instant::now() + SKIP_QUIET;
+            let deadline = quiet.min(held + SKIP_HOLD);
+            match tokio::time::timeout_at(deadline, requests.recv()).await {
+                Ok(Some(count)) => pending = pending.saturating_add(count),
+                Ok(None) => return,
+                Err(_) if pending == 0 => break,
+                Err(_) => {
+                    daemon.skip_now(pending).await;
+                    pending = 0;
+                    if tokio::time::Instant::now() >= held + SKIP_HOLD {
+                        break;
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -662,8 +790,21 @@ fn set_slot(slot: &SpircSlot, spirc: Option<Arc<librespot_connect::Spirc>>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Kind, failure};
-    use crate::spotify::Error;
+    use super::{Daemon, Kind, REFUSAL_LIMIT, SpircSlot, failure};
+    use crate::spotify::{Error, playing};
+
+    #[test]
+    fn windows_hear_of_refusals_once_per_run_of_them() {
+        let (skips, _requests) = tokio::sync::mpsc::unbounded_channel();
+        let daemon = Daemon::new(SpircSlot::default(), playing::shared(0), skips);
+        for _ in 1..REFUSAL_LIMIT {
+            assert!(!daemon.refused());
+        }
+        assert!(daemon.refused(), "the limit is reached");
+        for _ in 1..REFUSAL_LIMIT {
+            assert!(!daemon.refused(), "counting starts over");
+        }
+    }
 
     #[test]
     fn failures_say_what_kind_they_are() {

@@ -7,6 +7,7 @@
 
 use super::{DEVICE_NAME, NowTrack, Repeat, playing};
 use crate::protocol::PlayerUpdate;
+use tokio::sync::mpsc::UnboundedSender;
 use librespot_connect::Spirc;
 use std::{
     collections::HashMap,
@@ -40,7 +41,12 @@ pub struct Mpris {
 }
 
 /// Publishes the MPRIS player on the session bus.
-pub async fn serve(slot: SpircSlot, playing: playing::Shared) -> zbus::Result<Mpris> {
+/// `skips` takes skips forward: the service gathers quick ones into one jump.
+pub async fn serve(
+    slot: SpircSlot,
+    playing: playing::Shared,
+    skips: UnboundedSender<u32>,
+) -> zbus::Result<Mpris> {
     let connection = connection::Builder::session()?
         .serve_at(PATH, Root)?
         .serve_at(
@@ -49,9 +55,10 @@ pub async fn serve(slot: SpircSlot, playing: playing::Shared) -> zbus::Result<Mp
                 slot: slot.clone(),
                 playing,
                 art: None,
+                skips: skips.clone(),
             },
         )?
-        .serve_at(PATH, Queue { slot })?
+        .serve_at(PATH, Queue { slot, skips })?
         .build()
         .await?;
     // A second spotitui claims a name of its own, as MPRIS asks of multiple instances.
@@ -95,7 +102,7 @@ impl Mpris {
             PlayerUpdate::Volume(_) => Change::Volume,
             PlayerUpdate::Shuffle(_) => Change::Shuffle,
             PlayerUpdate::Repeat(_) => Change::Loop,
-            PlayerUpdate::Muted(_) | PlayerUpdate::Unavailable => return,
+            PlayerUpdate::Muted(_) | PlayerUpdate::Unavailable | PlayerUpdate::Refusing => return,
         };
         // A listener that misses one update catches up on the next.
         let _ = announce(&self.player, change).await;
@@ -286,6 +293,7 @@ fn metadata(track: &NowTrack, art: Option<&str>) -> Vec<(&'static str, Value<'st
 /// spotitui's own additions, beside the standard MPRIS interfaces.
 struct Queue {
     slot: SpircSlot,
+    skips: UnboundedSender<u32>,
 }
 
 #[interface(name = "io.spotitui.Queue")]
@@ -300,20 +308,23 @@ impl Queue {
             )));
         }
         let spirc = current(&self.slot)?;
-        failed(skip(&spirc, offset))
+        if offset > 0 {
+            // Forward: one jump to the track, through the service.
+            return self
+                .skips
+                .send(offset.unsigned_abs())
+                .map_err(|_| fdo::Error::Failed("spotitui is stopping".into()));
+        }
+        failed(back(&spirc, offset.unsigned_abs()))
     }
 }
 
 /// Spirc runs commands one at a time in the order sent, so a seek to 0:00 right
 /// before "previous" is always seen by it: under 3 seconds in, previous goes back.
-fn skip(spirc: &Spirc, offset: i32) -> Result<(), librespot_core::Error> {
-    for _ in 0..offset.unsigned_abs() {
-        if offset < 0 {
-            spirc.set_position_ms(0)?;
-            spirc.prev()?;
-        } else {
-            spirc.next()?;
-        }
+fn back(spirc: &Spirc, count: u32) -> Result<(), librespot_core::Error> {
+    for _ in 0..count {
+        spirc.set_position_ms(0)?;
+        spirc.prev()?;
     }
     Ok(())
 }
@@ -362,12 +373,16 @@ struct Player {
     playing: playing::Shared,
     /// The local cover file of a track, by URI.
     art: Option<(String, String)>,
+    skips: UnboundedSender<u32>,
 }
 
 #[interface(name = "org.mpris.MediaPlayer2.Player")]
 impl Player {
     fn next(&self) -> fdo::Result<()> {
-        failed(self.spirc()?.next())
+        self.spirc()?;
+        self.skips
+            .send(1)
+            .map_err(|_| fdo::Error::Failed("spotitui is stopping".into()))
     }
 
     fn previous(&self) -> fdo::Result<()> {

@@ -422,6 +422,11 @@ impl App {
             PlayerUpdate::Unavailable => {
                 self.warn("Spotify can't play this track here; skipping it.".into());
             }
+            PlayerUpdate::Refusing => self.warn(
+                "Spotify is refusing tracks for a moment (often after skipping fast); \
+                 it moves on until one plays."
+                    .into(),
+            ),
         }
     }
 

@@ -11,7 +11,7 @@ use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
 
 /// Bumped whenever a message changes shape, so a window and a service built from
 /// different versions notice it instead of misreading each other.
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 3;
 
 /// What a window shows when it and the service speak different versions.
 pub fn mismatch(service: u32) -> String {
@@ -192,6 +192,9 @@ pub enum PlayerUpdate {
     Shuffle(bool),
     Repeat(Repeat),
     Unavailable,
+    /// Spotify refused several tracks in a row, usually for a minute or two
+    /// after many skips; the speaker keeps moving on until one plays.
+    Refusing,
 }
 
 /// Writes one message as a line of JSON.

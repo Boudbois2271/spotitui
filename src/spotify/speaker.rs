@@ -187,6 +187,32 @@ impl Speaker {
         self.mixer.set_muted(muted);
     }
 
+    /// Skips ahead to a track of the play queue with a single load, however far
+    /// it is, rather than loading every track on the way (`skip_next` with a
+    /// track, as other Spotify apps send).
+    pub fn skip_to(
+        &self,
+        uri: String,
+        uid: String,
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'static {
+        let session = self.session.clone();
+        async move {
+            run(async move {
+                let mut track = serde_json::json!({ "uri": uri });
+                if !uid.is_empty() {
+                    track["uid"] = serde_json::Value::String(uid);
+                }
+                let command = serde_json::json!({
+                    "endpoint": "skip_next",
+                    "track": track,
+                    "logging_params": {},
+                });
+                send_command(&session, command).await
+            })
+            .await
+        }
+    }
+
     /// Plays a track right after the current one, ahead of tracks queued before.
     /// `queue` is the play queue as Spotify last reported it.
     pub fn play_next(

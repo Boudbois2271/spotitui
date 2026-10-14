@@ -94,6 +94,8 @@ pub struct Around {
 /// track first without losing the rest.
 #[derive(Clone, Debug, PartialEq)]
 pub struct LiveQueue {
+    /// What plays from: a playlist, album or artist; empty for a list of tracks.
+    pub context_uri: String,
     pub current_uri: String,
     pub next: Vec<ProvidedTrack>,
     pub prev: Vec<ProvidedTrack>,
@@ -369,6 +371,7 @@ async fn around(
             })
             .collect(),
         queue: state.track.as_ref().map(|track| LiveQueue {
+            context_uri: state.context_uri.clone(),
             current_uri: track.uri.clone(),
             next: state.next_tracks.clone(),
             prev: state.prev_tracks.clone(),
@@ -404,6 +407,23 @@ fn neighbors(
             .map(|(index, track)| (index as i32 + 1, track.uri.clone())),
     );
     tracks
+}
+
+/// The track `count` places after `playing` in the queue, if the queue knows it.
+/// The queue may still describe a track played before `playing` (the observer
+/// hears of a skip a moment after it happens); `playing` is then found in it.
+pub fn skip_target<'a>(
+    queue: &'a LiveQueue,
+    playing: &str,
+    count: usize,
+) -> Option<&'a ProvidedTrack> {
+    let next: Vec<&ProvidedTrack> = queue.next.iter().filter(|track| playable(track)).collect();
+    let after = if queue.current_uri == playing {
+        0
+    } else {
+        next.iter().position(|track| track.uri == playing)? + 1
+    };
+    next.get(after + count.checked_sub(1)?).copied()
 }
 
 /// Skips the markers Spotify mixes into the queue, such as `spotify:delimiter`.
@@ -478,6 +498,7 @@ mod tests {
             context_name: String::new(),
             tracks: Vec::new(),
             queue: Some(LiveQueue {
+                context_uri: String::new(),
                 current_uri: current.into(),
                 next: Vec::new(),
                 prev: Vec::new(),
@@ -488,6 +509,32 @@ mod tests {
         assert!(!shows(None, Some("spotify:track:a")));
         assert!(!shows(Some(&around("spotify:track:a")), Some("spotify:track:b")));
         assert!(shows(Some(&around("spotify:track:b")), Some("spotify:track:b")));
+    }
+
+    #[test]
+    fn skip_targets_count_from_the_playing_track() {
+        let queue = LiveQueue {
+            context_uri: String::new(),
+            current_uri: "spotify:track:a".into(),
+            next: vec![
+                track("spotify:track:b"),
+                track("spotify:delimiter"),
+                track("spotify:track:c"),
+                track("spotify:track:d"),
+            ],
+            prev: Vec::new(),
+            revision: String::new(),
+        };
+        let target = |playing: &str, count| {
+            super::skip_target(&queue, playing, count).map(|track| track.uri.as_str())
+        };
+        assert_eq!(target("spotify:track:a", 1), Some("spotify:track:b"));
+        assert_eq!(target("spotify:track:a", 2), Some("spotify:track:c"), "past the marker");
+        // The queue still shows a, but b already plays.
+        assert_eq!(target("spotify:track:b", 2), Some("spotify:track:d"));
+        assert_eq!(target("spotify:track:a", 9), None, "beyond the known queue");
+        assert_eq!(target("spotify:track:z", 1), None, "a queue about something else");
+        assert_eq!(target("spotify:track:a", 0), None);
     }
 
     #[test]
