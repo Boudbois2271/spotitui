@@ -15,6 +15,7 @@ mod speaker;
 
 pub use auth::{Authorization, Token, forget, store_refresh_token, stored_refresh_token};
 pub use catalog::{Catalog, search_uri};
+pub use library::Liked;
 pub use lyrics::Lyrics;
 pub use model::{Album, Artist, NowTrack, Playlist, Repeat, Track};
 pub use speaker::{Command, Connection, DEVICE_NAME, Mode, Play, Speaker, now_track};

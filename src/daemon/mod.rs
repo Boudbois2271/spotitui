@@ -302,11 +302,14 @@ impl Daemon {
             Request::Like(uri) => {
                 check_track(&uri)?;
                 let catalog = self.catalog()?;
-                if catalog.is_liked(&uri).await.map_err(text)? {
-                    return Ok(Response::Liked { added: false });
+                let mut liked = self.liked(&catalog).await.map_err(text)?;
+                let added = !liked.contains(&uri);
+                if added {
+                    catalog.set_liked(uri.clone(), true).await.map_err(text)?;
+                    liked.insert(uri);
                 }
-                catalog.set_liked(uri, true).await.map_err(text)?;
-                Ok(Response::Liked { added: true })
+                self.state().liked = Some(liked);
+                Ok(Response::Liked { added })
             }
             Request::AddToPlaylists { track, playlists } => {
                 check_track(&track)?;
@@ -361,6 +364,21 @@ impl Daemon {
             .command(command)
             .map_err(|error| failure(&error))?;
         Ok(Response::Done)
+    }
+
+    /// Liked Songs as they are now: the kept set brought up to date with one
+    /// small request, or read whole the first time (or when Spotify can't say
+    /// what changed).
+    async fn liked(&self, catalog: &Catalog) -> std::result::Result<spotify::Liked, spotify::Error> {
+        let kept = self.state().liked.take();
+        if let Some(mut liked) = kept
+            && catalog.update_liked(&mut liked).await?
+        {
+            return Ok(liked);
+        }
+        let liked = catalog.liked().await?;
+        log::info!("read Liked Songs: {} items", liked.len());
+        Ok(liked)
     }
 
     /// Takes a speaker event: updates the state, MPRIS and every window.

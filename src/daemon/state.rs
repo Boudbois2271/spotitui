@@ -31,6 +31,9 @@ pub struct State {
     pub live_queue: Option<spotify::queue::LiveQueue>,
     /// Whether the output is muted; separate from the volume, and kept across runs.
     pub muted: bool,
+    /// Liked Songs, kept up to date through the collection's changes, so saving a
+    /// track needs no full read to tell whether it is already there.
+    pub liked: Option<spotify::Liked>,
 }
 
 #[derive(Clone, Debug)]
@@ -87,6 +90,7 @@ impl State {
             tracks_name: None,
             live_queue: None,
             muted: saved_muted(),
+            liked: None,
         }
     }
 
@@ -109,6 +113,7 @@ impl State {
         let volume = self.player.volume;
         self.player = PlayerState::new(volume);
         self.live_queue = None;
+        self.liked = None;
         self.live.take()
     }
 
