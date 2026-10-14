@@ -98,15 +98,13 @@ impl Mpris {
 }
 
 /// Downloads the track's cover to `$XDG_RUNTIME_DIR/spotitui/covers/` and
-/// publishes it as a `file://` URL, keeping only the latest cover on disk.
+/// publishes it as a `file://` URL. Files are named after Spotify's image ID,
+/// so the tracks of an album share one download.
 async fn publish_cover(player: InterfaceRef<Player>, http: reqwest::Client, track: Track) {
     let (Some(remote), Some(dir)) = (track.remote_art.clone(), covers_dir()) else {
         return;
     };
-    let path = dir.join(format!(
-        "{}.jpg",
-        track.path().rsplit('/').next().unwrap_or("cover")
-    ));
+    let path = dir.join(format!("{}.jpg", cover_name(&remote, &track.id)));
     if !path.exists() {
         let Ok(bytes) = async {
             http.get(&remote)
@@ -123,16 +121,11 @@ async fn publish_cover(player: InterfaceRef<Player>, http: reqwest::Client, trac
         if std::fs::create_dir_all(&dir).is_err() {
             return;
         }
-        let partial = path.with_extension("partial");
+        // Named per track: two tracks of an album may download the same image at once.
+        let partial = dir.join(format!("{}.partial", track.id));
         if std::fs::write(&partial, &bytes).is_err() || std::fs::rename(&partial, &path).is_err() {
+            let _ = std::fs::remove_file(&partial);
             return;
-        }
-        if let Ok(entries) = std::fs::read_dir(&dir) {
-            for entry in entries.flatten() {
-                if entry.path() != path {
-                    let _ = std::fs::remove_file(entry.path());
-                }
-            }
         }
     }
     let url = format!("file://{}", path.display());
@@ -140,11 +133,49 @@ async fn publish_cover(player: InterfaceRef<Player>, http: reqwest::Client, trac
         let mut player = player.get_mut().await;
         match &mut player.now.track {
             Some(current) if current.id == track.id => current.art_url = Some(url),
-            // Another track started meanwhile; its own download will publish.
+            // Another track started meanwhile; its own download publishes, and cleans up.
             _ => return,
         }
     }
     let _ = announce(&player, Change::Track).await;
+    prune_covers(&dir, &path, std::time::SystemTime::now());
+}
+
+/// The file name for a cover: the last part of its URL (Spotify's image ID),
+/// or the track's ID for a URL without a usable one.
+fn cover_name(url: &str, track_id: &str) -> String {
+    let name: String = url
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .collect();
+    if name.is_empty() {
+        track_id.to_owned()
+    } else {
+        name
+    }
+}
+
+/// Removes old covers. Keeps `current`, downloads in progress, and covers from
+/// the last minute: a newer track's may have just landed.
+fn prune_covers(dir: &std::path::Path, current: &std::path::Path, now: std::time::SystemTime) {
+    const RECENT: Duration = Duration::from_secs(60);
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let recent = entry
+            .metadata()
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|modified| now.duration_since(modified).unwrap_or_default() < RECENT);
+        let partial = path.extension().is_some_and(|extension| extension == "partial");
+        if path != current && !recent && !partial {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 fn covers_dir() -> Option<std::path::PathBuf> {
@@ -676,7 +707,7 @@ fn failed(result: Result<(), librespot_core::Error>) -> fdo::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Change, Loop, Now, Status, Track};
+    use super::{Change, Loop, Now, Status, Track, cover_name, prune_covers};
     use librespot_playback::player::PlayerEvent;
     use std::time::Duration;
 
@@ -705,6 +736,40 @@ mod tests {
         let keys: Vec<_> = metadata.iter().map(|(key, _)| *key).collect();
         assert!(keys.contains(&"mpris:trackid"));
         assert!(keys.contains(&"xesam:url"));
+    }
+
+    #[test]
+    fn covers_are_named_after_the_image() {
+        assert_eq!(
+            cover_name("https://i.scdn.co/image/ab67616d0000b273abc", "t1"),
+            "ab67616d0000b273abc"
+        );
+        assert_eq!(cover_name("https://example.com/", "t1"), "t1");
+    }
+
+    #[test]
+    fn pruning_keeps_the_current_new_and_partial_covers() {
+        let dir = std::env::temp_dir().join(format!("spotitui-covers-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temporary directory");
+        let file = |name: &str, age: u64| {
+            let path = dir.join(name);
+            std::fs::write(&path, b"jpg").expect("writes");
+            let modified = std::time::SystemTime::now() - Duration::from_secs(age);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .and_then(|file| file.set_modified(modified))
+                .expect("sets the time");
+            path
+        };
+        let current = file("current.jpg", 600);
+        let old = file("old.jpg", 600);
+        let fresh = file("fresh.jpg", 5);
+        let partial = file("t2.partial", 600);
+        prune_covers(&dir, &current, std::time::SystemTime::now());
+        assert!(current.exists() && fresh.exists() && partial.exists());
+        assert!(!old.exists());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
