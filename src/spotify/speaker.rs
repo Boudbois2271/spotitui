@@ -2,7 +2,7 @@
 //!
 //! Adapted from fusor-rs/spotify-tui (MIT).
 
-use super::{Catalog, Error, Repeat, bounded, catalog::run};
+use super::{Catalog, Error, Repeat, bounded, catalog::run, output::Output};
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use librespot_connect::{
     ConnectConfig, LoadContextOptions, LoadRequest, LoadRequestOptions, Options, PlayingTrack,
@@ -13,10 +13,9 @@ use librespot_core::{
     dealer::protocol::TransferOptions, spclient::TransferRequest,
 };
 use librespot_playback::{
-    audio_backend,
-    config::{AudioFormat, PlayerConfig},
+    config::PlayerConfig,
     mixer::{Mixer, MixerConfig, VolumeGetter, softmixer::SoftMixer},
-    player::{Player, PlayerEventChannel},
+    player::{Player, PlayerEvent, PlayerEventChannel},
 };
 use librespot_protocol::player::ProvidedTrack;
 use serde::{Deserialize, Serialize};
@@ -26,8 +25,6 @@ use std::sync::{Arc, Mutex};
 pub const DEVICE_NAME: &str = "spotitui";
 /// Logging in and registering the speaker; librespot's own login has a shorter one.
 const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
-/// PulseAudio (PipeWire on Omarchy) names the stream in volume mixers; rodio/ALSA is the fallback.
-const PREFERRED_BACKEND: &str = "pulseaudio";
 
 /// A Spotify Connect speaker that plays audio on this computer.
 pub struct Speaker {
@@ -316,9 +313,7 @@ async fn start(
     access_token: String,
     initial_volume: u16,
 ) -> Result<Connection, Error> {
-    let backend = audio_backend::find(Some(PREFERRED_BACKEND.into()))
-        .or_else(|| audio_backend::find(None))
-        .ok_or(Error::NoAudio)?;
+    let output = Output::new();
     let mixer = Arc::new(MuteMixer::open(MixerConfig::default())?);
     let config = SessionConfig {
         device_id,
@@ -329,8 +324,12 @@ async fn start(
         PlayerConfig::default(),
         session.clone(),
         mixer.get_soft_volume(),
-        move || backend(None, AudioFormat::default()),
+        {
+            let output = output.clone();
+            move || output.sink()
+        },
     );
+    tokio::spawn(fade_on_loading(player.get_player_event_channel(), output));
     let events = player.get_player_event_channel();
     let handle = player.clone();
     let config = ConnectConfig {
@@ -356,6 +355,18 @@ async fn start(
         catalog,
         ended,
     })
+}
+
+/// The player stops writing sound while the next track loads; the old one
+/// fades out meanwhile rather than stop mid-sound.
+async fn fade_on_loading(mut events: PlayerEventChannel, output: Arc<Output>) {
+    while let Some(event) = events.recv().await {
+        if let PlayerEvent::Loading { .. } = event {
+            let output = output.clone();
+            // The write waits for room in the stream.
+            let _ = tokio::task::spawn_blocking(move || output.fade_out()).await;
+        }
+    }
 }
 
 /// A track as the queue holds it: Spotify plays queued tracks before the rest.

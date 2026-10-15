@@ -3809,6 +3809,8 @@ dependencies = [
  "crossterm",
  "futures-util",
  "http",
+ "libpulse-binding",
+ "libpulse-simple-binding",
  "librespot-connect",
  "librespot-core",
  "librespot-metadata",

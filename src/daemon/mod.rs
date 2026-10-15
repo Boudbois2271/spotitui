@@ -1387,6 +1387,6 @@ mod tests {
         assert_eq!(failure(&Error::Librespot(not_found)).kind, Kind::NotFound);
         let busy = librespot_core::Error::resource_exhausted("429");
         assert_eq!(failure(&Error::Librespot(busy)).kind, Kind::RateLimited);
-        assert_eq!(failure(&Error::NoAudio).kind, Kind::Other);
+        assert_eq!(failure(&Error::Observer("lost".into())).kind, Kind::Other);
     }
 }

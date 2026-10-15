@@ -220,7 +220,7 @@ and `src/protocol.rs` what they say to each other (one JSON message per line).
 Bump `protocol::VERSION` when a message changes shape: a window then warns that the
 service is older or newer than it, and a request the service doesn't know gets an
 error answer instead of a dropped connection.
-`src/spotify/` talks to Spotify (login, catalog, speaker, lyrics, MPRIS,
+`src/spotify/` talks to Spotify (login, catalog, speaker and its audio output, lyrics, MPRIS,
 library writes, the queue observer),
 `src/app/` holds state and input, `src/ui/` draws, `src/theme.rs` reads the
 Omarchy theme. Background work reports back to the main loop as `Msg`s, so all

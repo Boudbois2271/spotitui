@@ -8,6 +8,7 @@ mod library;
 mod live_tests;
 mod lyrics;
 mod model;
+mod output;
 pub mod mpris;
 pub mod playing;
 pub mod queue;
@@ -124,8 +125,6 @@ pub enum Error {
     Keyring(#[from] secret_service::Error),
     #[error("Spotify's login service is having trouble (HTTP {0}); trying again")]
     Accounts(u16),
-    #[error("No audio output is available on this computer")]
-    NoAudio,
     /// The play queue observer's own trouble, said as is.
     #[error("{0}")]
     Observer(String),
