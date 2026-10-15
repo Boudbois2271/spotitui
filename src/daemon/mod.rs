@@ -8,6 +8,7 @@ use crate::{
     protocol::{self, Event, Failure, Kind, PlayerUpdate, Request, Response, Status},
     spotify::{
         self, Catalog, Command, Connection, Lyrics, Speaker, Token,
+        secrets::Unlock,
         mpris::{self, Mpris, SpircSlot},
         queue::{self, Around},
     },
@@ -43,6 +44,8 @@ const GOODBYE_TIMEOUT: Duration = Duration::from_secs(3);
 const STOP_TIMEOUT: Duration = Duration::from_secs(5);
 /// How often a renewed login the keyring refused is offered to it again.
 const SAVE_LOGIN_INTERVAL: Duration = Duration::from_secs(60);
+/// How often a locked keyring is checked, without asking, for being unlocked.
+const KEYRING_POLL: Duration = Duration::from_secs(3);
 /// How often the session is checked for a lost connection.
 const SESSION_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 /// Skips asked for within this of each other are made in one go.
@@ -184,7 +187,7 @@ impl Daemon {
     /// it is still unsaved.
     async fn save_login(&self) -> Option<String> {
         let token = self.unsaved_login().clone()?;
-        match spotify::store_refresh_token(&token).await {
+        match spotify::store_refresh_token(&token, Unlock::Never).await {
             Ok(()) => {
                 log::info!("saved the renewed login to the keyring");
                 let mut unsaved = self.unsaved_login();
@@ -201,11 +204,11 @@ impl Daemon {
     }
 
     /// The login to use: one still waiting to be saved, else the keyring's.
-    async fn login(&self) -> std::result::Result<Option<String>, spotify::Error> {
+    async fn login(&self, unlock: Unlock) -> std::result::Result<Option<String>, spotify::Error> {
         if let Some(token) = self.save_login().await {
             return Ok(Some(token));
         }
-        spotify::stored_refresh_token().await
+        spotify::stored_refresh_token(unlock).await
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -621,12 +624,27 @@ fn failure(error: &spotify::Error) -> Failure {
 /// stored login, reconnects after the session ends, and waits while logged out.
 async fn supervise(daemon: Arc<Daemon>, mpris: Option<Arc<Mpris>>) {
     let mut failures = 0;
+    // A locked keyring asks for its password once; then the service waits for
+    // it to be unlocked, unless a window asks to be prompted again.
+    let mut unlock = Unlock::Ask;
     while !daemon.stopping.load(Ordering::SeqCst) {
-        let refresh_token = match daemon.login().await {
+        let refresh_token = match daemon.login(unlock).await {
             Ok(Some(token)) => token,
             Ok(None) => {
                 daemon.set_status(Status::LoggedOut);
                 daemon.reconnect.notified().await;
+                continue;
+            }
+            Err(error @ spotify::Error::KeyringLocked) => {
+                daemon.set_status(Status::Failed(failure(&error)));
+                if unlock == Unlock::Ask {
+                    log::info!("the keyring stayed locked; waiting for it to be unlocked");
+                }
+                unlock = Unlock::Never;
+                tokio::select! {
+                    () = tokio::time::sleep(KEYRING_POLL) => {}
+                    () = daemon.reconnect.notified() => unlock = Unlock::Ask,
+                }
                 continue;
             }
             // The keyring may still be locked right after login.
@@ -648,7 +666,7 @@ async fn supervise(daemon: Arc<Daemon>, mpris: Option<Arc<Mpris>>) {
             }
             Err(spotify::Error::Unauthorized)
                 if matches!(
-                    spotify::stored_refresh_token().await,
+                    spotify::stored_refresh_token(Unlock::Never).await,
                     Ok(Some(stored)) if stored != refresh_token
                 ) =>
             {
@@ -685,7 +703,7 @@ async fn connect(
 ) -> std::result::Result<Connection, spotify::Error> {
     let token = Token::refresh(&daemon.http, refresh_token).await?;
     if token.refresh_token() != refresh_token
-        && let Err(error) = token.store().await
+        && let Err(error) = token.store(Unlock::Never).await
     {
         // Keep going with the session; the login is saved on the next attempt.
         log::warn!("cannot save the renewed login, keeping it for now: {error}");

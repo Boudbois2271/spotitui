@@ -2,7 +2,10 @@
 //!
 //! Adapted from fusor-rs/spotify-tui (MIT).
 
-use super::{Error, secrets};
+use super::{
+    Error,
+    secrets::{self, Unlock},
+};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand::{Rng, distr::Alphanumeric};
 use reqwest::Url;
@@ -165,8 +168,8 @@ impl Token {
         &self.refresh
     }
 
-    pub async fn store(&self) -> Result<(), Error> {
-        secrets::store(&self.refresh).await
+    pub async fn store(&self, unlock: Unlock) -> Result<(), Error> {
+        secrets::store(&self.refresh, unlock).await
     }
 }
 
@@ -181,12 +184,12 @@ fn refusal(status: reqwest::StatusCode) -> Option<Error> {
     }
 }
 
-pub async fn store_refresh_token(token: &str) -> Result<(), Error> {
-    secrets::store(token).await
+pub async fn store_refresh_token(token: &str, unlock: Unlock) -> Result<(), Error> {
+    secrets::store(token, unlock).await
 }
 
-pub async fn stored_refresh_token() -> Result<Option<String>, Error> {
-    secrets::load().await
+pub async fn stored_refresh_token(unlock: Unlock) -> Result<Option<String>, Error> {
+    secrets::load(unlock).await
 }
 
 pub async fn forget() -> Result<(), Error> {

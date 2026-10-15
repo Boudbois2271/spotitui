@@ -11,7 +11,7 @@ mod model;
 pub mod mpris;
 pub mod playing;
 pub mod queue;
-mod secrets;
+pub mod secrets;
 mod speaker;
 
 pub use auth::{Authorization, Token, forget, store_refresh_token, stored_refresh_token};
@@ -115,6 +115,11 @@ pub enum Error {
     Callback(String),
     #[error("Login failed while talking to the browser: {0}")]
     Browser(#[from] std::io::Error),
+    #[error(
+        "Your system keyring is locked, so spotitui can't read your Spotify login. \
+         Unlock it when asked, or press Enter here to be asked again."
+    )]
+    KeyringLocked,
     #[error("Cannot use the system keyring for your login ({0})")]
     Keyring(#[from] secret_service::Error),
     #[error("Spotify's login service is having trouble (HTTP {0}); trying again")]

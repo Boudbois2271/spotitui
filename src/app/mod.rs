@@ -248,6 +248,11 @@ impl App {
 
     fn log_in(&mut self) {
         if !self.needs_login() {
+            // Any other failure: try again now. A locked keyring asks for its
+            // password again.
+            if matches!(self.screen, Screen::Failed(_)) {
+                self.send(Request::Reconnect);
+            }
             return;
         }
         let authorization = Authorization::new();
@@ -266,7 +271,11 @@ impl App {
             let local = |error: spotify::Error| Failure::new(Kind::NeedsLogin, error.to_string());
             let result = async {
                 let token = authorization.complete(&http, &page).await.map_err(local)?;
-                token.store().await.map_err(local)?;
+                // The user is at the window: the keyring may ask for its password.
+                token
+                    .store(spotify::secrets::Unlock::Ask)
+                    .await
+                    .map_err(local)?;
                 // The service reads the login from the keyring.
                 service.done(Request::Reconnect).await
             }

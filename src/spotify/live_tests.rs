@@ -9,14 +9,14 @@ use librespot_protocol::playlist4_external::SelectedListContent;
 use protobuf::Message;
 
 async fn catalog() -> Catalog {
-    let refresh = stored_refresh_token()
+    let refresh = stored_refresh_token(super::secrets::Unlock::Ask)
         .await
         .expect("keyring readable")
         .expect("logged in");
     let token = Token::refresh(&reqwest::Client::new(), &refresh)
         .await
         .expect("token refreshes");
-    token.store().await.expect("token stored");
+    token.store(super::secrets::Unlock::Ask).await.expect("token stored");
     let session = Session::new(SessionConfig::default(), None);
     session
         .connect(Credentials::with_access_token(token.access), false)
@@ -173,14 +173,14 @@ async fn live_undo() {
 #[tokio::test]
 #[ignore = "talks to Spotify"]
 async fn live_cluster() {
-    let refresh = stored_refresh_token()
+    let refresh = stored_refresh_token(super::secrets::Unlock::Ask)
         .await
         .expect("keyring readable")
         .expect("logged in");
     let token = Token::refresh(&reqwest::Client::new(), &refresh)
         .await
         .expect("token refreshes");
-    token.store().await.expect("token stored");
+    token.store(super::secrets::Unlock::Ask).await.expect("token stored");
     let config = SessionConfig {
         device_id: format!("hobs_{}", super::device_id("live test", 32)),
         ..SessionConfig::default()
@@ -261,14 +261,14 @@ async fn live_reusable_credentials() {
 #[tokio::test]
 #[ignore = "takes playback over from the running service"]
 async fn live_take_over() {
-    let refresh = stored_refresh_token()
+    let refresh = stored_refresh_token(super::secrets::Unlock::Ask)
         .await
         .expect("keyring readable")
         .expect("logged in");
     let token = Token::refresh(&reqwest::Client::new(), &refresh)
         .await
         .expect("token refreshes");
-    token.store().await.expect("token stored");
+    token.store(super::secrets::Unlock::Ask).await.expect("token stored");
     let device = super::device_id("live test speaker", 40);
     let connection = super::Speaker::connect_as(device, token.access.clone(), 0)
         .await
