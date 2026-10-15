@@ -6,7 +6,8 @@ import qs.Commons
 import qs.Ui
 
 // Spotify mini player for spotitui. Playback state and controls come from
-// spotitui's MPRIS player; the tracks around the current one come from
+// spotitui's MPRIS player; the tracks around the current one, the service's
+// status and the device Spotify plays on come from
 // $XDG_RUNTIME_DIR/spotitui/queue.json, which spotitui keeps up to date.
 Panel {
   id: root
@@ -20,6 +21,11 @@ Panel {
 
   // What is playing, such as a playlist's name, from queue.json.
   property string context: ""
+  // Why the service can't play right now ("connecting", "offline", "logged out"…),
+  // empty while connected; and the other device Spotify plays on, if any.
+  property string serviceStatus: ""
+  property string device: ""
+  property bool devicePlaying: false
   // The latest queue.json, kept until it matches the playing track.
   property var pendingQueue: null
   // Seconds; refreshed by the timer below, since MPRIS doesn't push positions.
@@ -36,6 +42,9 @@ Panel {
   readonly property bool running: player !== null
   readonly property bool hasTrack: running && !!player.trackTitle
   readonly property bool playing: running && player.isPlaying
+  readonly property bool loggedOut: running && serviceStatus === "logged out"
+  // Seeking and skipping work once the track is loaded here; Play brings it here.
+  readonly property bool controllable: hasTrack && player.canGoNext
   readonly property real length: hasTrack && player.lengthSupported ? player.length : 0
   // The list always has five slots: one before the playing track, the playing
   // track, three after. On a track change the slots shift at once (we already
@@ -52,7 +61,9 @@ Panel {
 
   readonly property string statusText: {
     if (!running) return "NOT RUNNING"
-    if (!hasTrack) return "NOTHING PLAYING"
+    if (serviceStatus) return serviceStatus.toUpperCase()
+    if (!hasTrack) return "NOTHING PLAYED YET"
+    if (!playing && device) return (devicePlaying ? "PLAYING ON " : "PAUSED ON ") + device.toUpperCase()
     return playing ? "PLAYING" : "PAUSED"
   }
 
@@ -65,18 +76,26 @@ Panel {
   }
 
   // When the track changes, MPRIS still reports the old track's position for a
-  // moment; don't let that flash on the new track's progress bar.
+  // moment; don't let that flash on the new track's progress bar. Once that
+  // moment is over, a paused track (as after spotitui starts) shows where it is.
   property double trackChangedAt: 0
 
+  Timer {
+    id: settleTimer
+    interval: 1100
+    onTriggered: root.syncPosition()
+  }
+
   function syncPosition() {
-    if (!hasTrack || seeking) return
+    // `player` goes before `hasTrack` follows when the service stops.
+    if (!player || !hasTrack || seeking) return
     player.positionChanged()
     if (Date.now() - trackChangedAt < 1000 && player.position > 3) return
     position = player.position
   }
 
   function togglePlay() { if (running && player.canTogglePlaying) player.togglePlaying() }
-  function previous() { if (running && player.canGoPrevious) player.previous() }
+  function previous() { if (controllable && player.canGoPrevious) player.previous() }
   function next() { if (running && player.canGoNext) player.next() }
   function seekTo(seconds) {
     if (!hasTrack || !player.canSeek) return
@@ -87,7 +106,7 @@ Panel {
   // spotitui's io.spotitui.Queue.Skip does it in one ordered step; MPRIS alone
   // can't go back reliably (Previous restarts the track after 3 seconds).
   function skipTo(offset) {
-    if (!hasTrack || offset === 0) return
+    if (!controllable || offset === 0) return
     skipProc.offset = offset
     skipProc.command = ["busctl", "--user", "call", "--", String(player.dbusName),
                         "/org/mpris/MediaPlayer2", "io.spotitui.Queue", "Skip", "i", String(offset)]
@@ -151,12 +170,15 @@ Panel {
   }
 
   function loadQueue(text) {
+    var parsed = null
     try {
-      var parsed = JSON.parse(String(text || ""))
-      pendingQueue = parsed && parsed.tracks instanceof Array ? parsed : null
-    } catch (e) {
-      pendingQueue = null
-    }
+      parsed = JSON.parse(String(text || ""))
+    } catch (e) {}
+    pendingQueue = parsed && parsed.tracks instanceof Array ? parsed : null
+    // Not tied to the playing track: these apply at once.
+    serviceStatus = parsed ? String(parsed.status || "") : ""
+    device = parsed ? String(parsed.device || "") : ""
+    devicePlaying = !!(parsed && parsed.device_playing)
     applyPending()
   }
 
@@ -306,6 +328,7 @@ Panel {
     function onTrackTitleChanged() { root.position = 0; Qt.callLater(root.syncPosition) }
     function onPostTrackChanged() {
       root.trackChangedAt = Date.now()
+      settleTimer.restart()
       root.position = 0
       Qt.callLater(root.followTrack)
       heroFade.restart()
@@ -343,7 +366,7 @@ Panel {
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
-      onActivateRequested: root.running ? root.togglePlay() : root.launch()
+      onActivateRequested: root.hasTrack && !root.loggedOut ? root.togglePlay() : root.launch()
       onMoveRequested: function(dx, dy) {
         if (dx < 0) root.previous()
         else if (dx > 0) root.next()
@@ -461,11 +484,11 @@ Panel {
           }
         }
 
-        // ---------- Nothing playing: the window is where music is chosen ----------
+        // ---------- Not running, logged out or nothing played yet: the window helps ----------
         Button {
-          visible: !root.hasTrack
+          visible: !root.hasTrack || root.loggedOut
           width: parent.width
-          text: "Open spotitui"
+          text: root.loggedOut ? "Log in" : "Open spotitui"
           foreground: root.bar.foreground
           fontFamily: root.bar.fontFamily
           bordered: true
@@ -475,7 +498,7 @@ Panel {
         // ---------- Controls ----------
         Row {
           id: controls
-          visible: root.running
+          visible: root.hasTrack
           anchors.horizontalCenter: parent.horizontalCenter
           spacing: Style.space(10)
 
@@ -486,7 +509,7 @@ Panel {
             fontFamily: root.bar.fontFamily
             iconSize: Style.font.title
             bordered: true
-            enabled: root.hasTrack
+            enabled: root.controllable
             onClicked: root.previous()
           }
 
@@ -499,7 +522,7 @@ Panel {
             horizontalPadding: Style.spacing.controlPaddingX * 2
             bordered: true
             active: root.playing
-            enabled: root.hasTrack
+            enabled: root.hasTrack && !root.loggedOut
             onClicked: root.togglePlay()
           }
 
@@ -510,7 +533,7 @@ Panel {
             fontFamily: root.bar.fontFamily
             iconSize: Style.font.title
             bordered: true
-            enabled: root.hasTrack
+            enabled: root.controllable
             onClicked: root.next()
           }
         }
@@ -631,7 +654,7 @@ Panel {
               MouseArea {
                 id: rowMouse
                 anchors.fill: parent
-                enabled: !row.current && !row.empty
+                enabled: !row.current && !row.empty && root.controllable
                 hoverEnabled: true
                 cursorShape: Qt.PointingHandCursor
                 onClicked: root.skipTo(row.offset)
