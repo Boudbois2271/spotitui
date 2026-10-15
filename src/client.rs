@@ -56,6 +56,13 @@ impl Service {
         Self { requests }
     }
 
+    /// A service that never answers, for tests of the window alone.
+    #[cfg(test)]
+    pub fn detached() -> Self {
+        let (requests, _) = mpsc::unbounded_channel();
+        Self { requests }
+    }
+
     pub async fn request(&self, request: Request) -> Reply {
         let (reply, answer) = oneshot::channel();
         self.requests

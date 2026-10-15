@@ -28,6 +28,9 @@ const CHUNK: usize = 100;
 /// Rows below the window that load before they scroll into view.
 const PREFETCH_ROWS: usize = 30;
 const NOTICE_TIME: Duration = Duration::from_secs(4);
+/// Lyrics that failed for a passing reason (the network, a reconnect) load
+/// again after this, while shown.
+const LYRICS_RETRY: Duration = Duration::from_secs(10);
 const SEEK_STEP: Duration = Duration::from_secs(10);
 /// Ticks between checks of the Omarchy theme file.
 const THEME_POLL_TICKS: u64 = 4;
@@ -71,6 +74,18 @@ pub enum LyricsStatus {
 pub struct LyricsCache {
     pub uri: String,
     pub status: LyricsStatus,
+    /// When the status was last set.
+    since: Instant,
+}
+
+impl LyricsCache {
+    pub fn new(uri: String, status: LyricsStatus) -> Self {
+        Self {
+            uri,
+            status,
+            since: Instant::now(),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -388,6 +403,9 @@ impl App {
                     // and a list that failed loads again.
                     self.load_playlists();
                     self.retry();
+                    if self.view == View::Lyrics {
+                        self.ensure_lyrics();
+                    }
                 }
             }
             Status::Connecting if in_library => self.inform("Reconnecting to Spotify…"),
@@ -447,6 +465,14 @@ impl App {
             && let Some(theme) = self.theme_source.poll()
         {
             self.theme = theme;
+        }
+        // Lyrics shown as failed for a passing reason try again by themselves.
+        let retry = self.lyrics.as_ref().is_some_and(|cache| {
+            matches!(&cache.status, LyricsStatus::Failed(failure) if failure.is_transient())
+                && cache.since.elapsed() >= LYRICS_RETRY
+        });
+        if retry && self.view == View::Lyrics {
+            self.ensure_lyrics();
         }
     }
 
@@ -999,10 +1025,7 @@ impl App {
         if current {
             return;
         }
-        self.lyrics = Some(LyricsCache {
-            uri: track.uri.clone(),
-            status: LyricsStatus::Loading,
-        });
+        self.lyrics = Some(LyricsCache::new(track.uri.clone(), LyricsStatus::Loading));
         let (service, tx) = (self.service.clone(), self.tx.clone());
         tokio::spawn(async move {
             let uri = track.uri.clone();
@@ -1018,7 +1041,7 @@ impl App {
             Err(error) => LyricsStatus::Failed(error),
         };
         if self.lyrics.as_ref().is_some_and(|cache| cache.uri == uri) {
-            self.lyrics = Some(LyricsCache { uri, status });
+            self.lyrics = Some(LyricsCache::new(uri, status));
         }
     }
 
@@ -1124,4 +1147,56 @@ fn callback_page(theme: &Theme) -> String {
         hex(theme.text),
         hex(theme.accent),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{App, LYRICS_RETRY, LyricsCache, LyricsStatus, View};
+    use crate::{
+        client::Service,
+        protocol::{Failure, Kind},
+        spotify::NowTrack,
+        theme::ThemeSource,
+    };
+    use std::time::Instant;
+
+    fn showing_failed_lyrics(kind: Kind, view: View) -> App {
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(tx, crate::spotify::http(), ThemeSource::new(), Service::detached());
+        app.now.change_track(NowTrack {
+            uri: "spotify:track:t".into(),
+            name: "Track".into(),
+            artists: Vec::new(),
+            album: String::new(),
+            album_artists: Vec::new(),
+            duration_ms: 1,
+            art_url: None,
+        });
+        app.view = view;
+        app.lyrics = Some(LyricsCache {
+            uri: "spotify:track:t".into(),
+            status: LyricsStatus::Failed(Failure::new(kind, "no")),
+            since: Instant::now() - LYRICS_RETRY,
+        });
+        app
+    }
+
+    fn loading(app: &App) -> bool {
+        matches!(app.lyrics.as_ref().map(|cache| &cache.status), Some(LyricsStatus::Loading))
+    }
+
+    #[tokio::test]
+    async fn lyrics_that_failed_for_a_passing_reason_load_again_while_shown() {
+        let mut app = showing_failed_lyrics(Kind::Network, View::Lyrics);
+        app.tick();
+        assert!(loading(&app), "tried again");
+
+        let mut hidden = showing_failed_lyrics(Kind::Network, View::Tracks);
+        hidden.tick();
+        assert!(!loading(&hidden), "not while the lyrics aren't shown");
+
+        let mut lasting = showing_failed_lyrics(Kind::Other, View::Lyrics);
+        lasting.tick();
+        assert!(!loading(&lasting), "a lasting failure waits for the user");
+    }
 }
