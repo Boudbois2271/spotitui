@@ -373,9 +373,10 @@ Panel {
       }
       onCloseRequested: root.close()
       onTabRequested: function(direction) { root.switchPanel(direction) }
+      // The window's keys, and SUPER+- / = from anywhere.
       onTextKey: function(t) {
-        if (t === "n") root.next()
-        else if (t === "p") root.previous()
+        if (t === "=") root.next()
+        else if (t === "-") root.previous()
       }
 
       Column {
