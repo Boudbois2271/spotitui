@@ -5,7 +5,7 @@
 //!
 //! Adapted from fusor-rs/spotify-tui (MIT).
 
-use super::{DEVICE_NAME, NowTrack, Repeat, playing};
+use super::{Command, DEVICE_NAME, NowTrack, Repeat, playing};
 use crate::protocol::PlayerUpdate;
 use tokio::sync::mpsc::UnboundedSender;
 use librespot_connect::Spirc;
@@ -40,15 +40,27 @@ pub struct Mpris {
     _connection: Connection,
 }
 
+/// What MPRIS hands over to the service rather than to the speaker.
+pub struct Channels {
+    /// Skips forward: the service gathers quick ones into one jump.
+    pub skips: UnboundedSender<u32>,
+    /// Play while the playback isn't here: the service brings it here.
+    pub resumes: UnboundedSender<()>,
+    /// Seeks and volume changes: the service sends them on at a steady pace.
+    pub settings: UnboundedSender<Command>,
+}
+
 /// Publishes the MPRIS player on the session bus.
-/// `skips` takes skips forward: the service gathers quick ones into one jump.
-/// `resumes` takes Play while the playback isn't here: the service brings it here.
 pub async fn serve(
     slot: SpircSlot,
     playing: playing::Shared,
-    skips: UnboundedSender<u32>,
-    resumes: UnboundedSender<()>,
+    channels: Channels,
 ) -> zbus::Result<Mpris> {
+    let Channels {
+        skips,
+        resumes,
+        settings,
+    } = channels;
     let connection = connection::Builder::session()?
         .serve_at(PATH, Root)?
         .serve_at(
@@ -59,6 +71,7 @@ pub async fn serve(
                 art: None,
                 skips: skips.clone(),
                 resumes,
+                settings,
             },
         )?
         .serve_at(
@@ -404,6 +417,7 @@ struct Player {
     art: Option<(String, String)>,
     skips: UnboundedSender<u32>,
     resumes: UnboundedSender<()>,
+    settings: UnboundedSender<Command>,
 }
 
 #[interface(name = "org.mpris.MediaPlayer2.Player")]
@@ -549,7 +563,7 @@ impl Player {
     fn set_volume(&self, volume: f64) -> fdo::Result<()> {
         // Clamped to 0–1 first, so the conversion cannot overflow.
         let volume = (volume.clamp(0.0, 1.0) * f64::from(u16::MAX)).round() as u16;
-        failed(self.spirc()?.set_volume(volume))
+        self.setting(Command::Volume(volume))
     }
 
     #[zbus(property(emits_changed_signal = "false"))]
@@ -617,9 +631,17 @@ impl Player {
 
     fn go_to(&self, position: i64) -> fdo::Result<()> {
         here(&self.playing)?;
+        self.spirc()?;
         // Positions past u32 milliseconds (49 days) clamp to the end of the track.
         let millis = (position / MICROS_PER_MILLI).try_into().unwrap_or(u32::MAX);
-        failed(self.spirc()?.set_position_ms(millis))
+        self.setting(Command::Seek(millis))
+    }
+
+    /// Hands a seek or a volume to the service.
+    fn setting(&self, command: Command) -> fdo::Result<()> {
+        self.settings
+            .send(command)
+            .map_err(|_| fdo::Error::Failed("spotitui is stopping".into()))
     }
 }
 

@@ -199,7 +199,10 @@ notch) with the wheel.
 - **Volume** is remembered in `~/.local/state/spotitui/volume`. **Mute** (`m`) is a
   status of its own, kept in `~/.local/state/spotitui/muted`: it silences the output
   without touching the volume, which Spotify Connect and MPRIS keep showing. Volume
-  changes while muted set the level unmuting returns to.
+  changes while muted set the level unmuting returns to. A held key's volume steps
+  and seeks show at once and reach Spotify about three times a second, the last one
+  always: each updates Spotify's record of the playback, which refuses a dozen a
+  second.
 
 ## Develop
 

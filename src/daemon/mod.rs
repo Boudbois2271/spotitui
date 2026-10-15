@@ -1,6 +1,7 @@
 //! The background service (`spotitui daemon`): owns the Spotify session, the
 //! speaker, MPRIS and the bar widget's queue file, and serves player windows.
 
+mod pace;
 mod server;
 mod state;
 
@@ -111,7 +112,13 @@ async fn serve() -> Result<()> {
     }
     let (skips, skip_requests) = mpsc::unbounded_channel();
     let (resumes, resume_requests) = mpsc::unbounded_channel();
-    let mpris = match mpris::serve(slot.clone(), playing.clone(), skips.clone(), resumes).await {
+    let (settings, setting_requests) = mpsc::unbounded_channel();
+    let channels = mpris::Channels {
+        skips: skips.clone(),
+        resumes,
+        settings: settings.clone(),
+    };
+    let mpris = match mpris::serve(slot.clone(), playing.clone(), channels).await {
         Ok(mpris) => Some(Arc::new(mpris)),
         // Without a session bus the player still works, just without media keys.
         Err(error) => {
@@ -119,7 +126,7 @@ async fn serve() -> Result<()> {
             None
         }
     };
-    let daemon = Arc::new(Daemon::new(slot, playing, skips, mpris));
+    let daemon = Arc::new(Daemon::new(slot, playing, skips, settings, mpris));
     if let Some(last) = last {
         let track = last.track.clone();
         daemon.state().show_last(last);
@@ -130,6 +137,7 @@ async fn serve() -> Result<()> {
     }
     daemon.publish_feed();
     tokio::spawn(gather_skips(daemon.clone(), skip_requests));
+    tokio::spawn(pace_settings(daemon.clone(), setting_requests));
     tokio::spawn(take_resumes(daemon.clone(), resume_requests));
     log::info!("spotitui service listening on {}", path.display());
     let mut supervisor = tokio::spawn(supervise(daemon.clone()));
@@ -192,6 +200,10 @@ pub struct Daemon {
     http: reqwest::Client,
     /// Skips forward, from windows and MPRIS, gathered by [`gather_skips`].
     skips: mpsc::UnboundedSender<u32>,
+    /// Seeks and volume changes, from windows and MPRIS, sent on by [`pace_settings`].
+    settings: mpsc::UnboundedSender<Command>,
+    /// Those waiting for their turn.
+    paced: Mutex<pace::Settings>,
     mpris: Option<Arc<Mpris>>,
     /// Spotify's playback as the play queue observer last saw it, this session.
     cluster: watch::Sender<Option<Around>>,
@@ -202,10 +214,13 @@ impl Daemon {
         slot: SpircSlot,
         playing: spotify::playing::Shared,
         skips: mpsc::UnboundedSender<u32>,
+        settings: mpsc::UnboundedSender<Command>,
         mpris: Option<Arc<Mpris>>,
     ) -> Self {
         Self {
             skips,
+            settings,
+            paced: Mutex::new(pace::Settings::default()),
             mpris,
             cluster: watch::Sender::new(None),
             state: Mutex::new(State::new(playing)),
@@ -251,6 +266,12 @@ impl Daemon {
             return Ok(Some(token));
         }
         spotify::stored_refresh_token(unlock).await
+    }
+
+    fn paced(&self) -> MutexGuard<'_, pace::Settings> {
+        self.paced
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     fn state(&self) -> MutexGuard<'_, State> {
@@ -344,6 +365,7 @@ impl Daemon {
                     state.taking_over = None;
                     state.restore_queue = None;
                 }
+                self.paced().seek.clear();
                 self.speaker()?.play(play, mode).map_err(text)?;
                 Ok(Response::Done)
             }
@@ -438,15 +460,17 @@ impl Daemon {
             let _ = self.skips.send(1);
             return Ok(Response::Done);
         }
-        if let Command::Volume(volume) = command {
-            // Kept for when the speaker becomes active, and for the next connection.
-            self.state().wanted_volume = Some(volume);
-            state::save_volume(volume);
-            // Windows show it now; an inactive speaker won't report it until it plays.
-            self.broadcast(Event::Player(PlayerUpdate::Volume(volume)));
-            if self.speaker().is_err() {
-                return Ok(Response::Done);
+        if let Command::Seek(_) | Command::Volume(_) = command {
+            // A volume is kept for when there's a speaker; a seek needs one.
+            if let Command::Seek(_) = command {
+                self.speaker()?;
             }
+            let _ = self.settings.send(command);
+            return Ok(Response::Done);
+        }
+        if command == Command::Previous {
+            // A seek waiting its turn is for the track playing now.
+            self.paced().seek.clear();
         }
         self.speaker()?
             .command(command)
@@ -461,6 +485,8 @@ impl Daemon {
         let Ok(speaker) = self.speaker() else {
             return;
         };
+        // A seek waiting its turn is for the track playing now.
+        self.paced().seek.clear();
         if count > 1 {
             // Right after a jump the observer may not have heard of it yet; its
             // queue then can't say what comes so far ahead. Give it a moment.
@@ -494,6 +520,45 @@ impl Daemon {
                 log::warn!("cannot skip: {error}");
                 return;
             }
+        }
+    }
+
+    /// Takes a volume asked for: windows show it at once, and it's kept for
+    /// the next connection and for a speaker that isn't the player yet.
+    fn want_volume(&self, volume: u16) {
+        self.state().wanted_volume = Some(volume);
+        state::save_volume(volume);
+        self.broadcast(Event::Player(PlayerUpdate::Volume(volume)));
+    }
+
+    /// Sends a volume to the speaker. One that isn't Spotify's player would
+    /// ignore it; it gets it once it plays.
+    fn volume_now(&self, volume: u16) {
+        if !self.state().playing().here {
+            return;
+        }
+        if let Ok(speaker) = self.speaker()
+            && let Err(error) = speaker.command(Command::Volume(volume))
+        {
+            log::warn!("cannot set the volume: {error}");
+        }
+    }
+
+    /// Sends a seek to the speaker, if `track` still plays here.
+    fn seek_now(&self, track: &str, position_ms: u32) {
+        let current = {
+            let state = self.state();
+            let playing = state.playing();
+            playing.here && playing.track.as_ref().is_some_and(|playing| playing.uri == track)
+        };
+        if !current {
+            log::debug!("dropping a seek in {track}, which no longer plays here");
+            return;
+        }
+        if let Ok(speaker) = self.speaker()
+            && let Err(error) = speaker.command(Command::Seek(position_ms))
+        {
+            log::warn!("cannot seek: {error}");
         }
     }
 
@@ -1094,6 +1159,42 @@ async fn gather_skips(daemon: Arc<Daemon>, mut requests: mpsc::UnboundedReceiver
     }
 }
 
+/// Sends seeks and volume changes on to the speaker at a steady pace (see
+/// [`pace`]); windows show them at once, and the last one asked for always goes.
+async fn pace_settings(daemon: Arc<Daemon>, mut requests: mpsc::UnboundedReceiver<Command>) {
+    loop {
+        let due = daemon.paced().due();
+        tokio::select! {
+            request = requests.recv() => match request {
+                Some(Command::Seek(position_ms)) => {
+                    let track = daemon.state().playing().track.as_ref().map(|track| track.uri.clone());
+                    if let Some(track) = track {
+                        daemon.paced().seek.ask((track, position_ms));
+                    }
+                }
+                Some(Command::Volume(volume)) => {
+                    daemon.want_volume(volume);
+                    daemon.paced().volume.ask(volume);
+                }
+                Some(other) => log::warn!("not a seek or a volume: {other:?}"),
+                None => return,
+            },
+            () = tokio::time::sleep_until(due.unwrap_or_else(tokio::time::Instant::now)), if due.is_some() => {}
+        }
+        let now = tokio::time::Instant::now();
+        let (seek, volume) = {
+            let mut paced = daemon.paced();
+            (paced.seek.take(now), paced.volume.take(now))
+        };
+        if let Some((track, position_ms)) = seek {
+            daemon.seek_now(&track, position_ms);
+        }
+        if let Some(volume) = volume {
+            daemon.volume_now(volume);
+        }
+    }
+}
+
 /// Spotify reads an empty URI in a reordered queue as "the current track".
 fn check_track(uri: &str) -> std::result::Result<(), Failure> {
     let playable = ["spotify:track:", "spotify:episode:"]
@@ -1386,7 +1487,8 @@ mod tests {
     #[test]
     fn windows_hear_of_refusals_once_per_run_of_them() {
         let (skips, _requests) = tokio::sync::mpsc::unbounded_channel();
-        let daemon = Daemon::new(SpircSlot::default(), playing::shared(0), skips, None);
+        let (settings, _settings) = tokio::sync::mpsc::unbounded_channel();
+        let daemon = Daemon::new(SpircSlot::default(), playing::shared(0), skips, settings, None);
         for _ in 1..REFUSAL_LIMIT {
             assert!(!daemon.refused());
         }
