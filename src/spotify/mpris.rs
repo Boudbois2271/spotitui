@@ -158,8 +158,8 @@ impl Mpris {
     }
 }
 
-/// Downloads the track's cover to `$XDG_RUNTIME_DIR/spotitui/covers/` and
-/// publishes it as a `file://` URL. Files are named after Spotify's image ID,
+/// Downloads the track's cover to `~/.cache/spotitui/covers/` and publishes
+/// it as a `file://` URL. Files are named after Spotify's image ID,
 /// so the tracks of an album share one download.
 async fn publish_cover(player: InterfaceRef<Player>, http: reqwest::Client, track: NowTrack) {
     let (Some(remote), Some(dir)) = (track.art_url.clone(), covers_dir()) else {

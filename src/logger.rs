@@ -4,6 +4,11 @@
 
 use std::{fs::File, io::Write, sync::Mutex, time::SystemTime};
 
+/// Libraries that only say something useful at error level. symphonia, which
+/// decodes the audio, warns for every frame it can't read: thousands a minute
+/// while Spotify withholds decryption keys and librespot plays the encrypted file.
+const NOISY: &[&str] = &["symphonia"];
+
 struct Logger {
     output: Mutex<Box<dyn Write + Send>>,
     /// The level for spotitui's own messages.
@@ -15,8 +20,11 @@ struct Logger {
 
 impl log::Log for Logger {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
-        let limit = if metadata.target().starts_with("spotitui") {
+        let target = metadata.target();
+        let limit = if target.starts_with("spotitui") {
             self.level
+        } else if NOISY.iter().any(|noisy| target.starts_with(noisy)) {
+            self.others.min(log::LevelFilter::Error)
         } else {
             self.others
         };
@@ -108,4 +116,28 @@ pub fn init_daemon() {
         others,
         timestamps,
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Logger;
+    use log::{Level, LevelFilter, Log};
+    use std::sync::Mutex;
+
+    #[test]
+    fn symphonia_only_speaks_up_for_errors() {
+        let logger = Logger {
+            output: Mutex::new(Box::new(std::io::sink())),
+            level: LevelFilter::Debug,
+            others: LevelFilter::Debug,
+            timestamps: false,
+        };
+        let enabled = |target, level| {
+            logger.enabled(&log::Metadata::builder().target(target).level(level).build())
+        };
+        assert!(enabled("spotitui::daemon", Level::Debug));
+        assert!(enabled("librespot_playback::player", Level::Warn));
+        assert!(!enabled("symphonia_bundle_mp3::demuxer", Level::Warn));
+        assert!(enabled("symphonia_core::probe", Level::Error));
+    }
 }
