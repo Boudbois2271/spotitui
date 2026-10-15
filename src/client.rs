@@ -6,7 +6,7 @@
 use crate::{
     protocol::{
         self, ClientMessage, Event, Failure, Incoming, Kind, Request, Response, ServerMessage,
-        read_line, write_message,
+        Snapshot, read_line, write_message,
     },
     spotify::{Lyrics, NowTrack, Playlist, Track},
 };
@@ -27,6 +27,8 @@ const UNIT: &str = "spotitui.service";
 const RETRY: Duration = Duration::from_millis(250);
 /// Attempts before telling the window the service won't come up (it keeps trying).
 const PATIENCE: u32 = 40;
+/// How long a one-off request from the command line waits for its answer.
+const ONCE_TIMEOUT: Duration = Duration::from_secs(3);
 
 pub enum Notification {
     Connected,
@@ -275,32 +277,60 @@ fn unit_installed() -> bool {
 
 /// Tells a running service to forget the login; quiet if none runs.
 pub async fn logout() {
-    let Some(path) = protocol::socket_path() else {
-        return;
-    };
-    let Ok(stream) = UnixStream::connect(&path).await else {
-        return;
-    };
+    let _ = once(|_| Request::Logout).await;
+}
+
+/// Sends one request to a running service and waits for its answer, for the
+/// command line (`spotitui next` from a desktop shortcut). The request is made
+/// from the snapshot the service sends first. A service that isn't running is
+/// not started: there's nothing playing to control.
+pub async fn once(request: impl FnOnce(&Snapshot) -> Request) -> Result<(), Failure> {
+    let gone = || Failure::new(Kind::ServiceDown, "The spotitui service isn't running");
+    let path = protocol::socket_path().ok_or_else(gone)?;
+    let stream = UnixStream::connect(&path).await.map_err(|_| gone())?;
     let (read, mut write) = stream.into_split();
-    let message = ClientMessage {
-        id: 1,
-        request: Request::Logout,
-    };
-    if write_message(&mut write, &message).await.is_err() {
-        return;
-    }
     let mut reader = BufReader::new(read);
     let mut line = String::new();
-    let wait_reply = async {
-        while let Ok(true) = read_line(&mut reader, &mut line).await {
-            if let Ok(
-                Incoming::Message(ServerMessage::Reply { id: 1, .. })
-                | Incoming::Unknown { id: Some(1), .. },
-            ) = protocol::parse::<ServerMessage>(&line)
+    let exchange = async {
+        let snapshot = loop {
+            if !read_line(&mut reader, &mut line).await.unwrap_or(false) {
+                return Err(gone());
+            }
+            if let Ok(Incoming::Message(ServerMessage::Event(Event::Snapshot(snapshot)))) =
+                protocol::parse::<ServerMessage>(&line)
             {
-                return;
+                break snapshot;
+            }
+        };
+        let message = ClientMessage {
+            id: 1,
+            request: request(&snapshot),
+        };
+        write_message(&mut write, &message)
+            .await
+            .map_err(|_| gone())?;
+        while let Ok(true) = read_line(&mut reader, &mut line).await {
+            match protocol::parse::<ServerMessage>(&line) {
+                Ok(Incoming::Message(ServerMessage::Reply { id: 1, result })) => {
+                    return result.map(|_| ());
+                }
+                Ok(Incoming::Unknown { id: Some(1), .. }) => {
+                    return Err(Failure::new(
+                        Kind::Unsupported,
+                        "The spotitui service answered in a newer format",
+                    ));
+                }
+                _ => {}
             }
         }
+        Err(gone())
     };
-    let _ = tokio::time::timeout(Duration::from_secs(3), wait_reply).await;
+    tokio::time::timeout(ONCE_TIMEOUT, exchange)
+        .await
+        .map_err(|_| {
+            Failure::new(
+                Kind::Other,
+                "The spotitui service didn't answer; see `journalctl --user -u spotitui`",
+            )
+        })?
 }

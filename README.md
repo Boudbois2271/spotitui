@@ -36,7 +36,12 @@ with it media keys) running from login, also install the systemd unit below.
 ```sh
 spotitui            # the player window; first run: press Enter, approve in the browser
 spotitui logout     # forget the saved login
+spotitui next       # also: previous, volume up, volume down (for desktop shortcuts)
 ```
+
+`spotitui next`, `previous` and `volume up`/`down` do what the player's `=`, `-`,
+`]` and `[` do, from anywhere: they ask the running service (they don't start
+it) and exit.
 
 spotitui is two programs in one binary:
 
@@ -82,8 +87,11 @@ default terminal with the app-id `spotitui` (via Omarchy's
   ```
 
 - `hypr/spotitui-bindings.lua`: `SUPER+CTRL+S` toggles the mini player (Share
-  moves to `SUPER+SHIFT+CTRL+S`) and `SUPER+CTRL+ALT+S` opens spotitui. Append it
-  to `~/.config/hypr/bindings.lua`, then check with `hyprctl configerrors`.
+  moves to `SUPER+SHIFT+CTRL+S`), `SUPER+CTRL+ALT+S` opens spotitui, and the
+  player's playback keys work from anywhere with `SUPER`: `SUPER+[`/`]` volume,
+  `SUPER+-`/`=` previous / next track (instead of Omarchy's resizing of a window
+  leftward). Append it to `~/.config/hypr/bindings.lua`, then check with
+  `hyprctl configerrors`.
 
 These are copies: edit the live files under `~/.config`, then copy them back here.
 

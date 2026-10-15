@@ -19,6 +19,7 @@ use crossterm::{
 };
 use futures_util::StreamExt;
 use ratatui::{Terminal, backend::CrosstermBackend};
+use spotify::Command;
 use std::{
     io::{Stdout, Write, stdout},
     process::ExitCode,
@@ -34,6 +35,8 @@ Usage:
   spotitui daemon     run the background service that plays the music; the player
                       starts it when needed, and systemd at login when installed
   spotitui logout     remove your Spotify login from this computer
+  spotitui next | previous | volume up | volume down
+                      control the playback from a shortcut, as the player's keys do
   spotitui --version  print the version
 
 Closing the player leaves the music playing; the service keeps going.
@@ -79,6 +82,12 @@ fn dispatch() -> Result<()> {
             println!("Logged out. Your Spotify login is removed from this computer.");
             Ok(())
         }
+        ["next"] => control(|_| Command::Next),
+        ["previous"] => control(|_| Command::Previous),
+        ["volume", direction @ ("up" | "down")] => {
+            let up = *direction == "up";
+            control(|now| Command::Volume(app::playback::volume_step(now.volume, up)))
+        }
         ["--version" | "-V"] => {
             println!("spotitui {}", env!("CARGO_PKG_VERSION"));
             Ok(())
@@ -89,6 +98,15 @@ fn dispatch() -> Result<()> {
         }
         _ => Err("Unknown arguments; run spotitui --help for usage".into()),
     }
+}
+
+/// Sends one playback command to the running service, made from what it plays.
+fn control(command: impl FnOnce(&protocol::Snapshot) -> Command) -> Result<()> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?
+        .block_on(client::once(|now| protocol::Request::Command(command(now))))
+        .map_err(|failure| failure.message.into())
 }
 
 fn run() -> Result<()> {
