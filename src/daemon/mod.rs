@@ -38,6 +38,11 @@ const BACKOFF: [Duration; 5] = [
 ];
 /// A pause after a session ends, before connecting again.
 const RECONNECT_DELAY: Duration = Duration::from_secs(1);
+/// A session that ends sooner than this counts as a failed attempt, so the
+/// next one waits longer: Spotify dropping every session right away (another
+/// player with this device ID, trouble on its side) must not turn into a
+/// reconnection every second.
+const SHORT_SESSION: Duration = Duration::from_secs(30);
 const EVENT_BACKLOG: usize = 256;
 /// How long the speaker gets to tell Spotify it is leaving.
 const GOODBYE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -1315,12 +1320,19 @@ async fn supervise(daemon: Arc<Daemon>) {
         daemon.set_status(Status::Connecting);
         match connect(&daemon, &refresh_token).await {
             Ok(connection) => {
-                failures = 0;
-                run_session(&daemon, connection).await;
+                let began = tokio::time::Instant::now();
+                let lost = run_session(&daemon, connection).await;
                 if daemon.stopping.load(Ordering::SeqCst) {
                     return;
                 }
-                tokio::time::sleep(RECONNECT_DELAY).await;
+                let lasted = began.elapsed();
+                if lost && lasted < SHORT_SESSION {
+                    log::warn!("the session lasted only {lasted:.1?}; waiting before the next");
+                    wait(&daemon, &mut failures).await;
+                } else {
+                    failures = 0;
+                    tokio::time::sleep(RECONNECT_DELAY).await;
+                }
             }
             Err(spotify::Error::Unauthorized)
                 if matches!(
@@ -1371,8 +1383,9 @@ async fn connect(
     Speaker::connect(token.access, volume).await
 }
 
-/// Serves one session until it ends or a reconnect is asked for.
-async fn run_session(daemon: &Arc<Daemon>, connection: Connection) {
+/// Serves one session until it ends or a reconnect is asked for; returns
+/// whether it ended by itself, as when the connection is lost.
+async fn run_session(daemon: &Arc<Daemon>, connection: Connection) -> bool {
     let Connection {
         speaker,
         mut events,
@@ -1496,6 +1509,7 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection) {
     daemon.set_status(Status::Connecting);
     let snapshot = daemon.snapshot();
     daemon.broadcast(Event::Snapshot(snapshot));
+    session_ended
 }
 
 /// The device ID the session registered its speaker as.
