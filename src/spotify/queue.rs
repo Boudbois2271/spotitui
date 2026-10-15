@@ -134,6 +134,10 @@ pub struct Feed {
     pub tracks: Vec<Entry>,
     /// Why nothing can play here right now, such as "offline"; empty while connected.
     pub status: String,
+    /// The other device Spotify plays (or is paused) on, by name; empty when
+    /// it's this one, or none.
+    pub device: String,
+    pub device_playing: bool,
 }
 
 /// Watches the play queue from a hidden observer session and calls `report`

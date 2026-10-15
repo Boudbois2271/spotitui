@@ -151,9 +151,10 @@ notch) with the wheel.
   last anywhere (a later play on your phone wins), with its playlist or album,
   queue, shuffle order, repeat and position. Play (`Space`, the media keys, the
   widget) then resumes it; pressed while still connecting, it plays once the
-  track is back. A device that is *playing* is never interrupted; Play brings
-  its playback here. If Spotify has nothing to hand over, the track saved here
-  is loaded again. After a crash or power cut,
+  track is back. A device that is *playing* is never interrupted: the widget
+  shows its track ("playing on …") and Play brings it here. The same goes when
+  another app takes the playback over later. If Spotify has nothing to hand
+  over, the track saved here is loaded again. After a crash or power cut,
   which Spotify records as still playing, the track comes back paused at the
   position saved here (every 15 s while playing).
 - **Single instance:** one service per user (a second one exits); any number
@@ -164,8 +165,8 @@ notch) with the wheel.
 - **Bar widget:** the tracks around the playing one (one before, three after)
   are written to `$XDG_RUNTIME_DIR/spotitui/queue.json` for the
   `boudbois.spotify` Omarchy bar widget, with the service's status
-  (`connecting`, `offline`, `logged out`…); the file is removed on exit. The
-  tracks come from
+  (`connecting`, `offline`, `logged out`…) and the device Spotify plays on when
+  it isn't this one; the file is removed on exit. The tracks come from
   Spotify's connect-state cluster, read by a second, hidden "observer" session
   (a `hobs_` device, as the web player uses), because Spotify doesn't send the
   cluster to the device that is playing. **Play next** (`Z`) uses that queue

@@ -56,6 +56,8 @@ pub struct State {
     /// The play queue Spotify had before a take-over, put back once the
     /// playback is here if librespot's differs (it shuffles anew).
     pub restore_queue: Option<spotify::queue::LiveQueue>,
+    /// Whether this session decided whether to bring the playback back.
+    pub restored: bool,
     /// Set when the speaker takes Spotify's playback over: its shuffle and
     /// repeat are then read from Spotify.
     pub adopt_options: bool,
@@ -119,6 +121,7 @@ impl State {
             taking_over: None,
             restore_seek: None,
             restore_queue: None,
+            restored: false,
             adopt_options: false,
             last_saved: None,
         }
@@ -200,6 +203,7 @@ impl State {
         self.taking_over = None;
         self.restore_seek = None;
         self.restore_queue = None;
+        self.restored = false;
         self.live_queue = None;
         self.liked = None;
         self.refusals.clear();

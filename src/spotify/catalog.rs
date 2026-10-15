@@ -3,9 +3,10 @@
 //!
 //! Adapted from fusor-rs/spotify-tui (MIT).
 
-use super::{Album, Artist, Error, Playlist, Track};
+use super::{Album, Artist, Error, NowTrack, Playlist, Track};
 use http::Method;
 use librespot_core::{Session, SpotifyUri};
+use librespot_metadata::audio::AudioItem;
 use librespot_protocol::{
     context_page::ContextPage,
     extended_metadata::{BatchedEntityRequest, EntityRequest, ExtensionQuery},
@@ -136,6 +137,16 @@ impl Catalog {
                 .into_iter()
                 .filter_map(|context| context.last_played_track_uri);
             Ok(unique_tracks(uris))
+        })
+        .await
+    }
+
+    /// A track as the speaker reports it when it plays: names, length and cover.
+    pub async fn now_track(&self, uri: String) -> Result<NowTrack, Error> {
+        let session = self.session.clone();
+        run(async move {
+            let item = AudioItem::get_file(&session, SpotifyUri::from_uri(&uri)?).await?;
+            Ok(super::playing::now_track(&item))
         })
         .await
     }

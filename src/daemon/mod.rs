@@ -561,7 +561,7 @@ impl Daemon {
     }
 
     /// Takes a speaker event: updates the state, MPRIS and every window.
-    async fn on_player_event(&self, event: PlayerEvent) {
+    async fn on_player_event(self: &Arc<Self>, event: PlayerEvent) {
         let mpris = self.mpris();
         if let PlayerEvent::TrackChanged { audio_item } = &event {
             self.playing.send_replace(Some(audio_item.uri.clone()));
@@ -665,6 +665,11 @@ impl Daemon {
                 mpris.controls_changed().await;
             }
             self.publish_feed();
+            // Another device took over: show what it plays.
+            let around = self.cluster.borrow().clone();
+            if let Some(around) = around {
+                self.spawn_mirror(around);
+            }
         }
     }
 
@@ -743,6 +748,88 @@ impl Daemon {
         result
     }
 
+    /// Shows Spotify's playback while it isn't here; looking the track up may
+    /// take a moment, which the session's events don't wait for.
+    fn spawn_mirror(self: &Arc<Self>, around: Around) {
+        let daemon = self.clone();
+        tokio::spawn(async move { daemon.mirror(around).await });
+    }
+
+    /// While the playback isn't here, shows Spotify's instead: what another
+    /// device plays, or what played last anywhere. Not before the session has
+    /// decided whether to bring it back: until then, the track shown is the
+    /// one saved here, and the position to bring back with it.
+    async fn mirror(&self, around: Around) {
+        let Some(uri) = around.queue.as_ref().map(|queue| queue.current_uri.clone()) else {
+            return;
+        };
+        let shown = {
+            let state = self.state();
+            let playing = state.playing();
+            if playing.here || !state.restored {
+                return;
+            }
+            playing.track.clone().filter(|track| track.uri == uri)
+        };
+        let (track, new) = match shown {
+            Some(track) => (track, false),
+            None => {
+                let Ok(catalog) = self.catalog() else {
+                    return;
+                };
+                match catalog.now_track(uri.clone()).await {
+                    Ok(track) => (track, true),
+                    Err(error) => {
+                        log::info!("cannot show {uri}: {error}");
+                        return;
+                    }
+                }
+            }
+        };
+        let (shuffle, repeat) = {
+            let state = self.state();
+            let mut playing = state.playing();
+            // It got here, or Spotify moved on, while the track was looked up.
+            let current = self
+                .cluster
+                .borrow()
+                .as_ref()
+                .and_then(|around| around.queue.as_ref())
+                .is_some_and(|queue| queue.current_uri == uri);
+            if playing.here || !state.restored || !current {
+                return;
+            }
+            let before = (playing.shuffle, playing.repeat);
+            playing.show(
+                track.clone(),
+                around.position_ms,
+                around.shuffle,
+                around.repeat,
+            );
+            before
+        };
+        let mut updates = Vec::new();
+        if new {
+            updates.push(PlayerUpdate::Track(track));
+        }
+        updates.push(PlayerUpdate::Paused {
+            position_ms: around.position_ms,
+        });
+        if shuffle != around.shuffle {
+            updates.push(PlayerUpdate::Shuffle(around.shuffle));
+        }
+        if repeat != around.repeat {
+            updates.push(PlayerUpdate::Repeat(around.repeat));
+        }
+        for update in updates {
+            if let Some(mpris) = self.mpris() {
+                mpris.changed(&update).await;
+            }
+            self.broadcast(Event::Player(update));
+        }
+        self.save_last();
+    }
+
     /// Saves what plays, if it changed, for the next start.
     fn save_last(&self) {
         let last = self.state().unsaved_last();
@@ -752,18 +839,32 @@ impl Daemon {
     }
 
     /// Writes what the bar widget shows besides MPRIS: the tracks around the
-    /// playing one, and the service's status.
+    /// playing one, the service's status, and the device Spotify plays on when
+    /// it isn't this one.
     fn publish_feed(&self) {
         let feed = {
             let mut state = self.state();
+            let own = state
+                .live
+                .as_ref()
+                .map(|live| live.catalog.session().device_id().to_owned());
+            let elsewhere = self.cluster.borrow().as_ref().and_then(|around| {
+                around
+                    .device
+                    .as_ref()
+                    .filter(|device| Some(&device.id) != own.as_ref())
+                    .map(|device| (device.name.clone(), !around.paused))
+            });
             state.feed.status = feed_status(&state.status).into();
+            (state.feed.device, state.feed.device_playing) = elsewhere.unwrap_or_default();
             state.feed.clone()
         };
         queue::write(&feed);
     }
 
-    /// Takes the observer's look at Spotify's playback: the bar widget's list.
-    async fn on_cluster(&self, around: Around) {
+    /// Takes the observer's look at Spotify's playback: the bar widget's list,
+    /// and what to show while the playback isn't here.
+    async fn on_cluster(self: &Arc<Self>, around: Around) {
         let (here, adopt, reorder) = {
             let mut state = self.state();
             state.live_queue = around.queue.clone();
@@ -813,6 +914,8 @@ impl Daemon {
         }
         if here {
             self.save_last();
+        } else {
+            self.spawn_mirror(around);
         }
     }
 
@@ -875,8 +978,16 @@ async fn take_resumes(daemon: Arc<Daemon>, mut requests: mpsc::UnboundedReceiver
 /// Brings back the playback as a session starts, paused: Spotify's (what
 /// played last, here or on another device), unless another device is playing
 /// it, or else what played last here. A Play asked for meanwhile plays it.
+/// Left elsewhere, Spotify's playback is shown instead.
 async fn restore(daemon: Arc<Daemon>, own: String) {
-    bring_back(&daemon, &own).await;
+    let took_over = bring_back(&daemon, &own).await;
+    daemon.state().restored = true;
+    if !took_over {
+        let around = daemon.cluster.borrow().clone();
+        if let Some(around) = around {
+            daemon.mirror(around).await;
+        }
+    }
 }
 
 /// Whether the session asked for the playback.
