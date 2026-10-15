@@ -221,6 +221,18 @@ async fn live_cluster() {
         state.is_some_and(|state| state.is_playing),
         state.is_some_and(|state| state.is_paused)
     );
+    if let Some(state) = state {
+        println!(
+            "track: {:?} in {:?} at {} of {} ms, {} s ago; shuffle {:?}; {} next",
+            state.track.as_ref().map(|track| &track.uri),
+            state.context_uri,
+            state.position_as_of_timestamp,
+            state.duration,
+            (cluster.server_timestamp_ms - state.timestamp) / 1000,
+            state.options.as_ref().map(|options| options.shuffling_context),
+            state.next_tracks.len(),
+        );
+    }
     for (id, device) in &cluster.device {
         println!(
             "device {} {:?} hidden={}",

@@ -778,8 +778,19 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
 
     daemon.playing.send_replace(None);
     set_slot(&daemon.slot, None);
+    let paused_at = {
+        let state = daemon.state();
+        let playing = state.playing();
+        (playing.status == spotify::playing::Status::Paused).then(|| playing.clock.elapsed_ms())
+    };
     let live = daemon.state().disconnect();
     if let Some(live) = &live {
+        // Leaving, librespot moves a paused track's position on by the time it
+        // sat paused, and Spotify keeps that: after an hour's pause, past the
+        // track's end. A seek first leaves it nothing to add.
+        if let Some(position) = paused_at {
+            let _ = live.speaker.command(Command::Seek(position));
+        }
         // Shut down explicitly: a request still holding the speaker would keep it alive.
         let _ = live.speaker.spirc().shutdown();
     }
