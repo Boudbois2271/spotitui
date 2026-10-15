@@ -98,20 +98,24 @@ pub struct Last {
 impl Last {
     /// The track within what it played from, to load it again.
     pub fn play(&self) -> Play {
-        let track = self.track.uri.clone();
-        // Lists of tracks get a made-up context that can't be loaded again.
-        let loadable = !self.context_uri.is_empty()
-            && !["spotify:web-api", "spotify:unknown"].contains(&self.context_uri.as_str());
-        if loadable {
-            Play::Context {
-                uri: self.context_uri.clone(),
-                track,
-            }
-        } else {
-            Play::Tracks {
-                uris: vec![track.clone()],
-                track,
-            }
+        play_within(&self.context_uri, self.track.uri.clone())
+    }
+}
+
+/// A track within what it played from (a playlist, album…), to load it again.
+pub fn play_within(context_uri: &str, track: String) -> Play {
+    // Lists of tracks get a made-up context that can't be loaded again.
+    let loadable =
+        !context_uri.is_empty() && !["spotify:web-api", "spotify:unknown"].contains(&context_uri);
+    if loadable {
+        Play::Context {
+            uri: context_uri.to_owned(),
+            track,
+        }
+    } else {
+        Play::Tracks {
+            uris: vec![track.clone()],
+            track,
         }
     }
 }

@@ -440,7 +440,7 @@ impl Player {
     }
 
     fn play_pause(&self) -> fdo::Result<()> {
-        if here(&self.playing).is_err() {
+        if needs_service(&self.playing) {
             return self.resume();
         }
         failed(self.spirc()?.play_pause())
@@ -451,7 +451,7 @@ impl Player {
     }
 
     fn play(&self) -> fdo::Result<()> {
-        if here(&self.playing).is_err() {
+        if needs_service(&self.playing) {
             return self.resume();
         }
         failed(self.spirc()?.play())
@@ -643,6 +643,14 @@ impl Player {
             .send(command)
             .map_err(|_| fdo::Error::Failed("spotitui is stopping".into()))
     }
+}
+
+/// Whether Play is for the service rather than the speaker: the playback
+/// isn't here (the service brings it here), or the speaker stopped (librespot
+/// ignores Play then; the service loads the track again).
+fn needs_service(playing: &playing::Shared) -> bool {
+    let playing = playing::lock(playing);
+    !playing.here || playing.status == playing::Status::Stopped
 }
 
 /// Whether the track shown is loaded here, so seeking and skipping work.

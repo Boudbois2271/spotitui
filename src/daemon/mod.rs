@@ -746,7 +746,14 @@ impl Daemon {
     /// Asked before the service is connected, it plays once the session
     /// brings the playback back, if that's soon.
     async fn resume(&self) -> std::result::Result<(), Failure> {
-        let here = self.state().playing().here;
+        let (here, stopped) = {
+            let state = self.state();
+            let playing = state.playing();
+            (playing.here, playing.status == spotify::playing::Status::Stopped)
+        };
+        if here && stopped {
+            return self.play_again();
+        }
         if here {
             return self
                 .speaker()?
@@ -759,6 +766,33 @@ impl Daemon {
             Err(_) if self.state().status == Status::Connecting => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    /// Plays after the speaker stopped: the list ran out, or Previous went back
+    /// past its first track. librespot ignores Play then, so the track Spotify
+    /// shows as current loads again, from its start, within what it played from.
+    fn play_again(&self) -> std::result::Result<(), Failure> {
+        let (play, mode) = {
+            let state = self.state();
+            let playing = state.playing();
+            let (context, track) = match &state.live_queue {
+                Some(queue) => (queue.context_uri.clone(), Some(queue.current_uri.clone())),
+                None => (state.context_uri.clone(), None),
+            };
+            let Some(track) = track.or_else(|| playing.track.as_ref().map(|track| track.uri.clone()))
+            else {
+                return Err(Failure::new(Kind::NotFound, "Nothing played yet"));
+            };
+            let mode = spotify::Mode {
+                shuffle: playing.shuffle,
+                repeat: playing.repeat,
+            };
+            (state::play_within(&context, track), mode)
+        };
+        log::info!("the speaker had stopped; playing again");
+        self.speaker()?
+            .load(play, mode, true, 0)
+            .map_err(|error| failure(&error))
     }
 
     /// Makes the speaker Spotify's player, paused. Spotify hands over its
