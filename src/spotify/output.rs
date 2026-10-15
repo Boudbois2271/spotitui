@@ -9,6 +9,10 @@
 //! of the old track and plays them when sound comes again: a blip of the old
 //! track just before the new one. So here the old track fades out when the next
 //! one has to load (or on a pause), and the stream starts afresh after a break.
+//!
+//! librespot exits the process when its output can't stop. When the sound
+//! server goes away (PipeWire restarting), the stream is opened again instead,
+//! and the music goes on after a moment.
 
 use libpulse_binding::{error::PAErr, sample, stream::Direction};
 use libpulse_simple_binding::Simple;
@@ -29,6 +33,10 @@ const BREAK: Duration = Duration::from_millis(40);
 /// A stream this close to playing all it was given counts as run dry; what is
 /// left of it plays before a new one starts.
 const NEARLY_DRY: Duration = Duration::from_millis(20);
+/// How often, and how far apart, a stream the sound server dropped is opened
+/// again: a restarting PipeWire is back within a second or two.
+const REOPEN_ATTEMPTS: u32 = 10;
+const REOPEN_WAIT: Duration = Duration::from_millis(200);
 
 /// The output, shared by the player, which writes the sound, and the speaker,
 /// which says when the track stops for another to load.
@@ -96,6 +104,13 @@ impl Stream {
         Ok(())
     }
 
+    fn write(&self, data: &[u8]) -> Result<(), PAErr> {
+        match &self.pulse {
+            Some(pulse) => pulse.write(data),
+            None => Err(PAErr(libpulse_binding::error::Code::BadState as i32)),
+        }
+    }
+
     fn wrote(&mut self) {
         // The latency is how long until the last sound written is heard.
         self.heard = self
@@ -112,6 +127,28 @@ impl Stream {
         let now = Instant::now();
         self.written.is_some_and(|written| now - written >= BREAK)
             && self.heard.is_some_and(|heard| now + NEARLY_DRY >= heard)
+    }
+
+    /// A new stream in place of one the sound server dropped, once the
+    /// server is back. Without one, there's no stream.
+    fn reopen(&mut self) -> SinkResult<()> {
+        self.pulse = None;
+        self.heard = None;
+        let mut attempt = 1;
+        loop {
+            match open() {
+                Ok(pulse) => {
+                    log::info!("the audio output is back");
+                    self.pulse = Some(pulse);
+                    return Ok(());
+                }
+                Err(error) if attempt == REOPEN_ATTEMPTS => return Err(error),
+                Err(_) => {
+                    attempt += 1;
+                    std::thread::sleep(REOPEN_WAIT);
+                }
+            }
+        }
     }
 
     /// A new stream in place of one that ran dry, once what is left has played.
@@ -153,17 +190,18 @@ impl Sink for OutputSink {
 
     fn stop(&mut self) -> SinkResult<()> {
         let mut stream = self.0.lock();
-        // A pause stops the track mid-sound too. librespot exits when stopping
-        // fails, so only a stream that can't play out fails.
+        // A pause stops the track mid-sound too.
         if let Err(error) = stream.fade_out() {
             log::debug!("cannot fade out: {error}");
         }
-        let Some(pulse) = stream.pulse.take() else {
-            return Ok(());
-        };
-        pulse.drain().map_err(|error| {
-            SinkError::OnWrite(format!("<PulseAudio> cannot play out the stream: {error}"))
-        })
+        // librespot exits when stopping fails. A stream that can't play out
+        // what it has is gone anyway; the next start opens a new one.
+        if let Some(pulse) = stream.pulse.take()
+            && let Err(error) = pulse.drain()
+        {
+            log::warn!("cannot play out the audio output: {error}");
+        }
+        Ok(())
     }
 
     fn write(&mut self, packet: AudioPacket, converter: &mut Converter) -> SinkResult<()> {
@@ -174,24 +212,23 @@ impl Sink for OutputSink {
         if stream.ran_dry() {
             stream.restart();
         }
-        let Stream {
-            pulse, tail, faded, ..
-        } = &mut *stream;
-        let pulse = pulse
-            .as_ref()
-            .ok_or_else(|| SinkError::NotConnected("<PulseAudio> no stream".into()))?;
-        match packet {
+        let (data, samples) = match packet {
             AudioPacket::Samples(samples) => {
                 let samples = converter.f64_to_s16(&samples);
-                pulse.write(&bytes(&samples)).map_err(on_write)?;
-                keep_tail(tail, &samples);
+                (bytes(&samples), Some(samples))
             }
-            AudioPacket::Raw(data) => {
-                pulse.write(&data).map_err(on_write)?;
-                tail.clear();
-            }
+            AudioPacket::Raw(data) => (data, None),
+        };
+        if let Err(error) = stream.write(&data) {
+            log::warn!("the audio output failed ({error}); opening it again");
+            stream.reopen()?;
+            stream.write(&data).map_err(on_write)?;
         }
-        *faded = false;
+        match samples {
+            Some(samples) => keep_tail(&mut stream.tail, &samples),
+            None => stream.tail.clear(),
+        }
+        stream.faded = false;
         stream.written = Some(Instant::now());
         stream.wrote();
         Ok(())
