@@ -689,7 +689,7 @@ Panel {
                   id: marker
                   anchors.left: parent.left
                   anchors.leftMargin: Style.space(8)
-                  anchors.verticalCenter: parent.verticalCenter
+                  anchors.baseline: titleText.baseline
                   width: Style.space(16)
                   textFormat: Text.PlainText
                   text: row.offset === 0 ? (root.playing ? "󰎈" : "󰏤") : (row.offset < 0 ? "󰒮" : String(row.offset))
