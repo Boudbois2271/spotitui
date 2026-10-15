@@ -54,6 +54,16 @@ const SKIP_QUIET: Duration = Duration::from_millis(400);
 const SKIP_HOLD: Duration = Duration::from_millis(1200);
 /// How long a jump waits for the play queue to describe its target.
 const SKIP_QUEUE_WAIT: Duration = Duration::from_millis(1500);
+/// How long a new session waits for its first look at Spotify's playback
+/// before restoring it; without one, it leaves the playback where it is.
+const RESTORE_WAIT: Duration = Duration::from_secs(10);
+/// Play asked for while the playback isn't here plays it once it is, if that
+/// is within this; later, music would start out of the blue.
+const PENDING_PLAY: Duration = Duration::from_secs(15);
+/// How long a take-over may take before another one is asked for.
+const TAKE_OVER_WAIT: Duration = Duration::from_secs(5);
+/// How often the position is saved while playing, for after a power cut.
+const SAVE_PROGRESS_INTERVAL: Duration = Duration::from_secs(15);
 /// This many tracks refused within [`REFUSAL_WINDOW`] make windows say why.
 const REFUSAL_LIMIT: usize = 5;
 const REFUSAL_WINDOW: Duration = Duration::from_secs(30);
@@ -85,8 +95,20 @@ async fn serve() -> Result<()> {
     let slot = SpircSlot::default();
     // What plays: the service's state and MPRIS read this one record.
     let playing = spotify::playing::shared(state::saved_volume());
+    // What played last shows right away, before MPRIS clients first look; the
+    // session brings it back.
+    let last = state::saved_last();
+    if let Some(last) = &last {
+        spotify::playing::lock(&playing).show(
+            last.track.clone(),
+            last.position_ms,
+            last.shuffle,
+            last.repeat,
+        );
+    }
     let (skips, skip_requests) = mpsc::unbounded_channel();
-    let mpris = match mpris::serve(slot.clone(), playing.clone(), skips.clone()).await {
+    let (resumes, resume_requests) = mpsc::unbounded_channel();
+    let mpris = match mpris::serve(slot.clone(), playing.clone(), skips.clone(), resumes).await {
         Ok(mpris) => Some(Arc::new(mpris)),
         // Without a session bus the player still works, just without media keys.
         Err(error) => {
@@ -94,10 +116,20 @@ async fn serve() -> Result<()> {
             None
         }
     };
-    let daemon = Arc::new(Daemon::new(slot, playing, skips));
+    let daemon = Arc::new(Daemon::new(slot, playing, skips, mpris));
+    if let Some(last) = last {
+        let track = last.track.clone();
+        daemon.state().show_last(last);
+        // Publishes its cover.
+        if let Some(mpris) = daemon.mpris() {
+            mpris.changed(&PlayerUpdate::Track(track)).await;
+        }
+    }
+    daemon.publish_feed();
     tokio::spawn(gather_skips(daemon.clone(), skip_requests));
+    tokio::spawn(take_resumes(daemon.clone(), resume_requests));
     log::info!("spotitui service listening on {}", path.display());
-    let mut supervisor = tokio::spawn(supervise(daemon.clone(), mpris));
+    let mut supervisor = tokio::spawn(supervise(daemon.clone()));
     let mut acceptor = tokio::spawn(server::accept(daemon.clone(), listener));
 
     let mut terminate = signal(SignalKind::terminate())?;
@@ -131,6 +163,7 @@ async fn serve() -> Result<()> {
     if tokio::time::timeout(STOP_TIMEOUT, supervisor).await.is_err() {
         log::warn!("the session didn't end in time");
     }
+    daemon.save_last();
     // A renewed login only in memory would be lost with the process.
     if daemon.save_login().await.is_some() {
         log::error!("the renewed login couldn't be saved; you may need to log in again");
@@ -156,6 +189,9 @@ pub struct Daemon {
     http: reqwest::Client,
     /// Skips forward, from windows and MPRIS, gathered by [`gather_skips`].
     skips: mpsc::UnboundedSender<u32>,
+    mpris: Option<Arc<Mpris>>,
+    /// Spotify's playback as the play queue observer last saw it, this session.
+    cluster: watch::Sender<Option<Around>>,
 }
 
 impl Daemon {
@@ -163,9 +199,12 @@ impl Daemon {
         slot: SpircSlot,
         playing: spotify::playing::Shared,
         skips: mpsc::UnboundedSender<u32>,
+        mpris: Option<Arc<Mpris>>,
     ) -> Self {
         Self {
             skips,
+            mpris,
+            cluster: watch::Sender::new(None),
             state: Mutex::new(State::new(playing)),
             events: broadcast::channel(EVENT_BACKLOG).0,
             reconnect: Notify::new(),
@@ -231,6 +270,10 @@ impl Daemon {
         let _ = self.events.send(event);
     }
 
+    fn mpris(&self) -> Option<&Mpris> {
+        self.mpris.as_deref()
+    }
+
     fn set_status(&self, status: Status) {
         {
             let mut state = self.state();
@@ -241,6 +284,7 @@ impl Daemon {
         }
         log::info!("status: {status:?}");
         self.broadcast(Event::Status(status));
+        self.publish_feed();
     }
 
     fn catalog(&self) -> std::result::Result<Catalog, Failure> {
@@ -290,11 +334,17 @@ impl Daemon {
                 mode,
                 context_name,
             } => {
-                self.state().remember_play(&play, &context_name);
+                {
+                    let mut state = self.state();
+                    state.remember_play(&play, &context_name);
+                    // A take-over on its way would keep this paused.
+                    state.taking_over = None;
+                    state.restore_queue = None;
+                }
                 self.speaker()?.play(play, mode).map_err(text)?;
                 Ok(Response::Done)
             }
-            Request::Command(command) => self.command(command),
+            Request::Command(command) => self.command(command).await,
             Request::PlayNext(uri) => {
                 check_track(&uri)?;
                 // Only a queue that describes what plays now can be reordered; an
@@ -374,7 +424,11 @@ impl Daemon {
         }
     }
 
-    fn command(&self, command: Command) -> std::result::Result<Response, Failure> {
+    async fn command(&self, command: Command) -> std::result::Result<Response, Failure> {
+        if command == Command::Resume {
+            self.resume().await?;
+            return Ok(Response::Done);
+        }
         if command == Command::Next {
             // Gathered with other quick skips; said at once if there's no speaker.
             self.speaker()?;
@@ -487,15 +541,62 @@ impl Daemon {
         Ok(liked)
     }
 
+    /// Forgets what played: it belongs to the account, and the next login
+    /// brings its own.
+    async fn forget_playback(&self) {
+        state::forget_last();
+        let had_track = {
+            let mut state = self.state();
+            let had = state.playing().track.is_some();
+            state.forget_playback();
+            had
+        };
+        if had_track {
+            if let Some(mpris) = self.mpris() {
+                mpris.refresh().await;
+            }
+            let snapshot = self.snapshot();
+            self.broadcast(Event::Snapshot(snapshot));
+        }
+    }
+
     /// Takes a speaker event: updates the state, MPRIS and every window.
-    async fn on_player_event(&self, event: PlayerEvent, mpris: Option<&Mpris>) {
+    async fn on_player_event(&self, event: PlayerEvent) {
+        let mpris = self.mpris();
         if let PlayerEvent::TrackChanged { audio_item } = &event {
             self.playing.send_replace(Some(audio_item.uri.clone()));
         }
-        let (relinked, update, resend_volume) = {
+        let (relinked, update, resend_volume, shown, here_changed, settle) = {
             let mut state = self.state();
             let relinked = state.playing().relink(&event);
+            let (was_here, shown) = {
+                let playing = state.playing();
+                (playing.here, playing.track.clone())
+            };
             let update = state.apply(&event);
+            let here = state.playing().here;
+            let arrived = here && !was_here;
+            let taken = arrived && state.taking_over.take().is_some();
+            if was_here && !here {
+                // Another device took over; a Play from before isn't for it.
+                state.pending_play = None;
+            }
+            // The playback is coming here: Spirc is loading the track, so a
+            // command now applies once it's loaded. (Sent on the "loaded"
+            // event instead, Spirc may take it before that event, then think
+            // it's paused while it plays.) Played if asked while it wasn't
+            // here; else kept paused, as Spotify hands over a playback cut
+            // short by a crash or power cut as playing.
+            let settle = if arrived && state.take_pending_play(PENDING_PLAY) {
+                Some((Command::Resume, state.restore_seek.take()))
+            } else if taken {
+                Some((Command::Pause, state.restore_seek.take()))
+            } else {
+                None
+            };
+            if matches!(update, Some(PlayerUpdate::Playing { .. })) {
+                state.pending_play = None;
+            }
             // The speaker is active once it plays; a volume it ignored before applies now.
             let resend = match (&update, state.wanted_volume) {
                 (Some(PlayerUpdate::Playing { .. }), Some(volume))
@@ -505,8 +606,21 @@ impl Daemon {
                 }
                 _ => None,
             };
-            (relinked, update, resend)
+            (relinked, update, resend, shown, was_here != here, settle)
         };
+        if let Some((command, seek)) = settle
+            && let Ok(speaker) = self.speaker()
+        {
+            if command == Command::Resume {
+                log::info!("playing what was brought here");
+            }
+            if let Err(error) = speaker.command(command) {
+                log::warn!("cannot {command:?}: {error}");
+            }
+            if let Some(position) = seek {
+                speaker.start_at(position);
+            }
+        }
         if let Some(track) = relinked {
             self.playing.send_replace(Some(track.uri.clone()));
             let update = PlayerUpdate::Track(track);
@@ -526,21 +640,298 @@ impl Daemon {
             self.broadcast(Event::Player(PlayerUpdate::Refusing));
         }
         if let Some(update) = update {
+            // The track shown before it got here is the one loaded: nothing to redraw.
+            let same = matches!(&update, PlayerUpdate::Track(track) if shown.as_ref() == Some(track));
+            if let Some(mpris) = mpris
+                && !same
+            {
+                mpris.changed(&update).await;
+            }
+            let changed = !matches!(
+                update,
+                PlayerUpdate::Position { .. }
+                    | PlayerUpdate::Volume(_)
+                    | PlayerUpdate::Muted(_)
+                    | PlayerUpdate::Unavailable
+                    | PlayerUpdate::Refusing
+            );
+            self.broadcast(Event::Player(update));
+            if changed {
+                self.save_last();
+            }
+        }
+        if here_changed {
             if let Some(mpris) = mpris {
+                mpris.controls_changed().await;
+            }
+            self.publish_feed();
+        }
+    }
+
+    /// Plays: resumes the playback here, or first brings it here, paused,
+    /// from before the service started or from another device, then plays it.
+    /// Asked before the service is connected, it plays once the session
+    /// brings the playback back, if that's soon.
+    async fn resume(&self) -> std::result::Result<(), Failure> {
+        let here = self.state().playing().here;
+        if here {
+            return self
+                .speaker()?
+                .command(Command::Resume)
+                .map_err(|error| failure(&error));
+        }
+        self.state().pending_play = Some(std::time::Instant::now());
+        match self.speaker() {
+            Ok(speaker) => self.take_over(&speaker).await,
+            Err(_) if self.state().status == Status::Connecting => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Makes the speaker Spotify's player, paused. Spotify hands over its
+    /// playback (what plays elsewhere, or what played last anywhere); if it has
+    /// none, the last track played here is loaded again.
+    async fn take_over(&self, speaker: &Speaker) -> std::result::Result<(), Failure> {
+        {
+            let mut state = self.state();
+            if state
+                .taking_over
+                .is_some_and(|asked| asked.elapsed() < TAKE_OVER_WAIT)
+            {
+                return Ok(());
+            }
+            state.taking_over = Some(std::time::Instant::now());
+        }
+        let spotify_has_none = self
+            .cluster
+            .borrow()
+            .as_ref()
+            .is_some_and(|around| around.queue.is_none());
+        self.state().adopt_options = true;
+        let result = if spotify_has_none {
+            match state::saved_last() {
+                Some(last) => {
+                    log::info!("Spotify has no playback; loading {} again", last.track.uri);
+                    let mode = spotify::Mode {
+                        shuffle: last.shuffle,
+                        repeat: last.repeat,
+                    };
+                    speaker
+                        .load(last.play(), mode, false, last.position_ms)
+                        .map_err(|error| failure(&error))
+                }
+                None => Err(Failure::new(Kind::NotFound, "Nothing played yet")),
+            }
+        } else {
+            log::info!("taking the playback over");
+            // librespot shuffles anew when it takes a shuffled playback over;
+            // the order Spotify kept is put back once it's here.
+            let queue = self
+                .cluster
+                .borrow()
+                .as_ref()
+                .and_then(|around| around.queue.clone());
+            self.state().restore_queue = queue;
+            speaker.take_over().await.map_err(|error| failure(&error))
+        };
+        if result.is_err() {
+            // Nothing is on its way: another Play may ask again.
+            let mut state = self.state();
+            state.taking_over = None;
+            state.restore_queue = None;
+        }
+        result
+    }
+
+    /// Saves what plays, if it changed, for the next start.
+    fn save_last(&self) {
+        let last = self.state().unsaved_last();
+        if let Some(last) = last {
+            state::save_last(&last);
+        }
+    }
+
+    /// Writes what the bar widget shows besides MPRIS: the tracks around the
+    /// playing one, and the service's status.
+    fn publish_feed(&self) {
+        let feed = {
+            let mut state = self.state();
+            state.feed.status = feed_status(&state.status).into();
+            state.feed.clone()
+        };
+        queue::write(&feed);
+    }
+
+    /// Takes the observer's look at Spotify's playback: the bar widget's list.
+    async fn on_cluster(&self, around: Around) {
+        let (here, adopt, reorder) = {
+            let mut state = self.state();
+            state.live_queue = around.queue.clone();
+            let own = state
+                .live
+                .as_ref()
+                .map(|live| live.catalog.session().device_id().to_owned());
+            let here = state.playing().here;
+            // Spotify's own record of this speaker, once it's the player.
+            let ours = here && around.device.as_ref().map(|device| &device.id) == own.as_ref();
+            let adopt = ours && std::mem::take(&mut state.adopt_options);
+            // The playback taken over settles here: librespot first loads the
+            // track alone, then its list, shuffled anew if shuffled. The order
+            // from before is put back, and the list from before stays shown
+            // meanwhile.
+            let settling = match (&state.restore_queue, &around.queue) {
+                (Some(saved), Some(queue)) => ours && saved.current_uri == queue.current_uri,
+                _ => false,
+            };
+            let reorder = match &around.queue {
+                Some(queue) if settling && !queue.next.is_empty() => state
+                    .restore_queue
+                    .take()
+                    .filter(|saved| !same_tracks(&saved.next, &queue.next))
+                    .map(|saved| (saved, queue.revision.clone())),
+                _ => None,
+            };
+            if !settling || (reorder.is_none() && state.restore_queue.is_none()) {
+                state.feed.context = state.context_name(&around.context_uri, &around.context_name);
+                state.feed.tracks = around.tracks.clone();
+                state.context_uri = around.context_uri.clone();
+            }
+            (here, adopt, reorder)
+        };
+        self.cluster.send_replace(Some(around.clone()));
+        self.publish_feed();
+        if adopt {
+            self.adopt_options(&around).await;
+        }
+        if let Some((saved, revision)) = reorder
+            && let Ok(speaker) = self.speaker()
+        {
+            log::info!("putting the play order back");
+            if let Err(error) = speaker.restore_queue(saved, revision).await {
+                log::warn!("cannot put the play order back: {error}");
+            }
+        }
+        if here {
+            self.save_last();
+        }
+    }
+
+    /// librespot takes over shuffle and repeat with Spotify's playback without
+    /// saying so; Spotify's record of this speaker says what they are.
+    async fn adopt_options(&self, around: &Around) {
+        let mut updates = Vec::new();
+        {
+            let state = self.state();
+            let mut playing = state.playing();
+            if playing.shuffle != around.shuffle {
+                playing.shuffle = around.shuffle;
+                updates.push(PlayerUpdate::Shuffle(around.shuffle));
+            }
+            if playing.repeat != around.repeat {
+                playing.repeat = around.repeat;
+                updates.push(PlayerUpdate::Repeat(around.repeat));
+            }
+        }
+        for update in updates {
+            if let Some(mpris) = self.mpris() {
                 mpris.changed(&update).await;
             }
             self.broadcast(Event::Player(update));
         }
     }
+}
 
-    /// Writes the tracks around the playing one for the bar widget.
-    fn publish_queue(&self, around: &Around) {
-        let name = {
-            let mut state = self.state();
-            state.live_queue = around.queue.clone();
-            state.context_name(&around.context_uri, &around.context_name)
-        };
-        queue::write(&name, &around.tracks);
+/// Whether two queues list the same tracks in the same order.
+fn same_tracks(
+    a: &[librespot_protocol::player::ProvidedTrack],
+    b: &[librespot_protocol::player::ProvidedTrack],
+) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.uri == b.uri)
+}
+
+/// What the bar widget says about the service while it can't play: empty when connected.
+fn feed_status(status: &Status) -> &'static str {
+    match status {
+        Status::Connected { .. } => "",
+        Status::Connecting => "connecting",
+        Status::LoggedOut => "logged out",
+        Status::Failed(failure) => match failure.kind {
+            Kind::NeedsLogin => "logged out",
+            Kind::Network | Kind::NotConnected => "offline",
+            _ => "not connected",
+        },
+    }
+}
+
+/// Takes Play from MPRIS while the playback isn't here.
+async fn take_resumes(daemon: Arc<Daemon>, mut requests: mpsc::UnboundedReceiver<()>) {
+    while requests.recv().await.is_some() {
+        if let Err(failure) = daemon.resume().await {
+            log::info!("cannot play: {failure}");
+        }
+    }
+}
+
+/// Brings back the playback as a session starts, paused: Spotify's (what
+/// played last, here or on another device), unless another device is playing
+/// it, or else what played last here. A Play asked for meanwhile plays it.
+async fn restore(daemon: Arc<Daemon>, own: String) {
+    bring_back(&daemon, &own).await;
+}
+
+/// Whether the session asked for the playback.
+async fn bring_back(daemon: &Daemon, own: &str) -> bool {
+    let mut cluster = daemon.cluster.subscribe();
+    let seen = tokio::time::timeout(RESTORE_WAIT, cluster.wait_for(Option::is_some)).await;
+    let Ok(Ok(around)) = seen.map(|seen| seen.map(|around| around.clone())) else {
+        log::warn!("no look at Spotify's playback in {RESTORE_WAIT:?}; leaving it where it is");
+        return false;
+    };
+    let Some(around) = around else {
+        return false;
+    };
+    let (here, asked) = {
+        let state = daemon.state();
+        let asked = state
+            .pending_play
+            .is_some_and(|asked| asked.elapsed() < PENDING_PLAY);
+        (state.playing().here, asked)
+    };
+    // A window, or another Spotify app, started something meanwhile.
+    if here {
+        return true;
+    }
+    if around.plays_elsewhere(own) && !asked {
+        let name = around.device.as_ref().map_or("", |device| &device.name);
+        log::info!("{name} is playing; leaving the playback there");
+        return false;
+    }
+    // Spotify says it plays, with no device playing it: the player died, as
+    // in a crash or power cut. It reckons the position on through the time
+    // since; the one saved here is closer, if it's the same track.
+    if !around.paused
+        && let Some(last) = state::saved_last()
+        && around
+            .queue
+            .as_ref()
+            .is_some_and(|queue| queue.current_uri == last.track.uri)
+    {
+        log::info!("the playback was cut short; going back to where it was saved");
+        daemon.state().restore_seek = Some(last.position_ms);
+    }
+    let Ok(speaker) = daemon.speaker() else {
+        return false;
+    };
+    match daemon.take_over(&speaker).await {
+        Ok(()) => true,
+        Err(failure) if failure.kind == Kind::NotFound => {
+            log::info!("nothing to bring back: {failure}");
+            false
+        }
+        Err(failure) => {
+            log::warn!("cannot bring the playback back: {failure}");
+            false
+        }
     }
 }
 
@@ -622,7 +1013,7 @@ fn failure(error: &spotify::Error) -> Failure {
 
 /// Keeps a session to Spotify for as long as the service runs: logs in with the
 /// stored login, reconnects after the session ends, and waits while logged out.
-async fn supervise(daemon: Arc<Daemon>, mpris: Option<Arc<Mpris>>) {
+async fn supervise(daemon: Arc<Daemon>) {
     let mut failures = 0;
     // A locked keyring asks for its password once; then the service waits for
     // it to be unlocked, unless a window asks to be prompted again.
@@ -631,6 +1022,7 @@ async fn supervise(daemon: Arc<Daemon>, mpris: Option<Arc<Mpris>>) {
         let refresh_token = match daemon.login(unlock).await {
             Ok(Some(token)) => token,
             Ok(None) => {
+                daemon.forget_playback().await;
                 daemon.set_status(Status::LoggedOut);
                 daemon.reconnect.notified().await;
                 continue;
@@ -658,7 +1050,7 @@ async fn supervise(daemon: Arc<Daemon>, mpris: Option<Arc<Mpris>>) {
         match connect(&daemon, &refresh_token).await {
             Ok(connection) => {
                 failures = 0;
-                run_session(&daemon, connection, mpris.as_deref()).await;
+                run_session(&daemon, connection).await;
                 if daemon.stopping.load(Ordering::SeqCst) {
                     return;
                 }
@@ -714,7 +1106,7 @@ async fn connect(
 }
 
 /// Serves one session until it ends or a reconnect is asked for.
-async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option<&Mpris>) {
+async fn run_session(daemon: &Arc<Daemon>, connection: Connection) {
     let Connection {
         speaker,
         mut events,
@@ -725,18 +1117,18 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
     // Muting belongs to the service, not the session: a new speaker starts muted too.
     speaker.set_muted(daemon.state().muted);
     set_slot(&daemon.slot, Some(speaker.spirc()));
-    let observer = {
-        let daemon = daemon.clone();
-        queue::observe(catalog.clone(), daemon.playing.subscribe(), move |around| {
-            daemon.publish_queue(&around);
-        })
-    };
+    daemon.cluster.send_replace(None);
+    let (clusters, mut cluster_updates) = mpsc::unbounded_channel();
+    let observer = queue::observe(catalog.clone(), daemon.playing.subscribe(), move |around| {
+        let _ = clusters.send(around);
+    });
     let liked_uri = catalog.liked_uri();
     daemon.state().live = Some(Live {
         speaker,
         catalog: catalog.clone(),
     });
     daemon.set_status(Status::Connected { liked_uri });
+    let restoring = tokio::spawn(restore(daemon.clone(), session_device(&catalog)));
     // Playlist names label the bar widget's queue; a failure only costs labels.
     let names = daemon.clone();
     let session = catalog.session().clone();
@@ -750,6 +1142,8 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
     save_login.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut check_session = tokio::time::interval(SESSION_CHECK_INTERVAL);
     check_session.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut save_progress = tokio::time::interval(SAVE_PROGRESS_INTERVAL);
+    save_progress.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let session_ended = loop {
         tokio::select! {
             // librespot marks the session invalid as soon as the server
@@ -764,10 +1158,17 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
             _ = save_login.tick() => {
                 daemon.save_login().await;
             }
+            _ = save_progress.tick() => {
+                let playing = daemon.state().playing().playing();
+                if playing {
+                    daemon.save_last();
+                }
+            }
             event = events.recv() => match event {
-                Some(event) => daemon.on_player_event(event, mpris).await,
+                Some(event) => daemon.on_player_event(event).await,
                 None => break false,
             },
+            Some(around) = cluster_updates.recv() => daemon.on_cluster(around).await,
             _ = &mut ended => {
                 log::info!("the Spotify session ended");
                 break true;
@@ -776,7 +1177,9 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
         }
     };
 
+    restoring.abort();
     daemon.playing.send_replace(None);
+    daemon.cluster.send_replace(None);
     set_slot(&daemon.slot, None);
     let paused_at = {
         let state = daemon.state();
@@ -810,13 +1213,21 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection, mpris: Option
     // Spirc closes its dealer last, after requests that can hang on a dead
     // connection; make sure it is closed, or the session stays alive.
     spotify::close_session(&session).await;
-    queue::clear();
-    if let Some(mpris) = mpris {
-        mpris.refresh().await;
+    // The track stays shown, paused, until the next session brings it back.
+    if let Some(mpris) = daemon.mpris() {
+        let position_ms = daemon.state().playing().clock.elapsed_ms();
+        mpris.changed(&PlayerUpdate::Paused { position_ms }).await;
+        mpris.controls_changed().await;
     }
+    daemon.save_last();
     daemon.set_status(Status::Connecting);
     let snapshot = daemon.snapshot();
     daemon.broadcast(Event::Snapshot(snapshot));
+}
+
+/// The device ID the session registered its speaker as.
+fn session_device(catalog: &Catalog) -> String {
+    catalog.session().device_id().to_owned()
 }
 
 fn set_slot(slot: &SpircSlot, spirc: Option<Arc<librespot_connect::Spirc>>) {
@@ -828,13 +1239,16 @@ fn set_slot(slot: &SpircSlot, spirc: Option<Arc<librespot_connect::Spirc>>) {
 
 #[cfg(test)]
 mod tests {
-    use super::{Daemon, Kind, REFUSAL_LIMIT, SpircSlot, failure};
-    use crate::spotify::{Error, playing};
+    use super::{Daemon, Kind, REFUSAL_LIMIT, SpircSlot, Status, failure, feed_status};
+    use crate::{
+        protocol::Failure,
+        spotify::{Error, playing},
+    };
 
     #[test]
     fn windows_hear_of_refusals_once_per_run_of_them() {
         let (skips, _requests) = tokio::sync::mpsc::unbounded_channel();
-        let daemon = Daemon::new(SpircSlot::default(), playing::shared(0), skips);
+        let daemon = Daemon::new(SpircSlot::default(), playing::shared(0), skips, None);
         for _ in 1..REFUSAL_LIMIT {
             assert!(!daemon.refused());
         }
@@ -842,6 +1256,17 @@ mod tests {
         for _ in 1..REFUSAL_LIMIT {
             assert!(!daemon.refused(), "counting starts over");
         }
+    }
+
+    #[test]
+    fn the_widget_hears_why_nothing_can_play() {
+        let failed = |kind| Status::Failed(Failure::new(kind, ""));
+        assert_eq!(feed_status(&Status::Connected { liked_uri: String::new() }), "");
+        assert_eq!(feed_status(&Status::Connecting), "connecting");
+        assert_eq!(feed_status(&Status::LoggedOut), "logged out");
+        assert_eq!(feed_status(&failed(Kind::NeedsLogin)), "logged out");
+        assert_eq!(feed_status(&failed(Kind::Network)), "offline");
+        assert_eq!(feed_status(&failed(Kind::Other)), "not connected");
     }
 
     #[test]

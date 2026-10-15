@@ -42,10 +42,12 @@ pub struct Mpris {
 
 /// Publishes the MPRIS player on the session bus.
 /// `skips` takes skips forward: the service gathers quick ones into one jump.
+/// `resumes` takes Play while the playback isn't here: the service brings it here.
 pub async fn serve(
     slot: SpircSlot,
     playing: playing::Shared,
     skips: UnboundedSender<u32>,
+    resumes: UnboundedSender<()>,
 ) -> zbus::Result<Mpris> {
     let connection = connection::Builder::session()?
         .serve_at(PATH, Root)?
@@ -53,12 +55,20 @@ pub async fn serve(
             PATH,
             Player {
                 slot: slot.clone(),
-                playing,
+                playing: playing.clone(),
                 art: None,
                 skips: skips.clone(),
+                resumes,
             },
         )?
-        .serve_at(PATH, Queue { slot, skips })?
+        .serve_at(
+            PATH,
+            Queue {
+                slot,
+                playing,
+                skips,
+            },
+        )?
         .build()
         .await?;
     // A second spotitui claims a name of its own, as MPRIS asks of multiple instances.
@@ -93,11 +103,16 @@ impl Mpris {
                     self.http.clone(),
                     track.clone(),
                 ));
+                let _ = announce(&self.player, Change::Controls).await;
                 Change::Track
             }
-            PlayerUpdate::Playing { .. } | PlayerUpdate::Paused { .. } | PlayerUpdate::Stopped => {
-                Change::Status
+            // Clients don't ask for the position; it may have moved, as when
+            // the playback is brought back or shown from another device.
+            PlayerUpdate::Playing { .. } | PlayerUpdate::Paused { .. } => {
+                let _ = announce(&self.player, Change::Status).await;
+                Change::Position
             }
+            PlayerUpdate::Stopped => Change::Status,
             PlayerUpdate::Seeked { .. } | PlayerUpdate::Position { .. } => Change::Position,
             PlayerUpdate::Volume(_) => Change::Volume,
             PlayerUpdate::Shuffle(_) => Change::Shuffle,
@@ -108,12 +123,18 @@ impl Mpris {
         let _ = announce(&self.player, change).await;
     }
 
-    /// Announces everything again, as after the session ended and the record
-    /// was cleared: clients show nothing playing.
+    /// Announces whether seeking and skipping work: only once the playback is here.
+    pub async fn controls_changed(&self) {
+        let _ = announce(&self.player, Change::Controls).await;
+    }
+
+    /// Announces everything again, as after the record was cleared: clients
+    /// show nothing playing.
     pub async fn refresh(&self) {
         self.player.get_mut().await.art = None;
         for change in [
             Change::Track,
+            Change::Controls,
             Change::Status,
             Change::Volume,
             Change::Shuffle,
@@ -210,19 +231,24 @@ fn prune_covers(dir: &std::path::Path, current: &std::path::Path, now: std::time
     }
 }
 
+/// In the cache, so the cover of what played last is there after a restart.
 fn covers_dir() -> Option<std::path::PathBuf> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")?;
-    Some(std::path::PathBuf::from(runtime).join("spotitui/covers"))
+    let cache = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| Some(std::path::PathBuf::from(std::env::var_os("HOME")?).join(".cache")))?;
+    Some(cache.join("spotitui/covers"))
 }
 
 async fn announce(player: &InterfaceRef<Player>, change: Change) -> zbus::Result<()> {
     let emitter = player.signal_emitter();
     let player = player.get().await;
     match change {
-        // Seeking becomes possible once there is a track; clients cache CanSeek.
-        Change::Track => {
-            player.metadata_changed(emitter).await?;
-            player.can_seek_changed(emitter).await
+        Change::Track => player.metadata_changed(emitter).await,
+        // Clients cache these; they change with the track and when it gets here.
+        Change::Controls => {
+            player.can_seek_changed(emitter).await?;
+            player.can_go_next_changed(emitter).await?;
+            player.can_go_previous_changed(emitter).await
         }
         Change::Status => player.playback_status_changed(emitter).await,
         Change::Volume => player.volume_changed(emitter).await,
@@ -239,6 +265,7 @@ async fn announce(player: &InterfaceRef<Player>, change: Change) -> zbus::Result
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum Change {
     Track,
+    Controls,
     Status,
     Volume,
     Shuffle,
@@ -293,6 +320,7 @@ fn metadata(track: &NowTrack, art: Option<&str>) -> Vec<(&'static str, Value<'st
 /// spotitui's own additions, beside the standard MPRIS interfaces.
 struct Queue {
     slot: SpircSlot,
+    playing: playing::Shared,
     skips: UnboundedSender<u32>,
 }
 
@@ -307,6 +335,7 @@ impl Queue {
                 "skip at most {MAX_SKIP} tracks either way, not {offset}"
             )));
         }
+        here(&self.playing)?;
         let spirc = current(&self.slot)?;
         if offset > 0 {
             // Forward: one jump to the track, through the service.
@@ -374,11 +403,13 @@ struct Player {
     /// The local cover file of a track, by URI.
     art: Option<(String, String)>,
     skips: UnboundedSender<u32>,
+    resumes: UnboundedSender<()>,
 }
 
 #[interface(name = "org.mpris.MediaPlayer2.Player")]
 impl Player {
     fn next(&self) -> fdo::Result<()> {
+        here(&self.playing)?;
         self.spirc()?;
         self.skips
             .send(1)
@@ -386,6 +417,7 @@ impl Player {
     }
 
     fn previous(&self) -> fdo::Result<()> {
+        here(&self.playing)?;
         failed(self.spirc()?.prev())
     }
 
@@ -394,6 +426,9 @@ impl Player {
     }
 
     fn play_pause(&self) -> fdo::Result<()> {
+        if here(&self.playing).is_err() {
+            return self.resume();
+        }
         failed(self.spirc()?.play_pause())
     }
 
@@ -402,6 +437,9 @@ impl Player {
     }
 
     fn play(&self) -> fdo::Result<()> {
+        if here(&self.playing).is_err() {
+            return self.resume();
+        }
         failed(self.spirc()?.play())
     }
 
@@ -536,12 +574,12 @@ impl Player {
 
     #[zbus(property)]
     fn can_go_next(&self) -> bool {
-        true
+        controllable(&self.playing)
     }
 
     #[zbus(property)]
     fn can_go_previous(&self) -> bool {
-        true
+        controllable(&self.playing)
     }
 
     #[zbus(property)]
@@ -556,7 +594,7 @@ impl Player {
 
     #[zbus(property)]
     fn can_seek(&self) -> bool {
-        playing::lock(&self.playing).track.is_some()
+        controllable(&self.playing)
     }
 
     #[zbus(property(emits_changed_signal = "const"))]
@@ -570,10 +608,36 @@ impl Player {
         current(&self.slot)
     }
 
+    /// Asks the service to bring the playback here and play it.
+    fn resume(&self) -> fdo::Result<()> {
+        self.resumes
+            .send(())
+            .map_err(|_| fdo::Error::Failed("spotitui is stopping".into()))
+    }
+
     fn go_to(&self, position: i64) -> fdo::Result<()> {
+        here(&self.playing)?;
         // Positions past u32 milliseconds (49 days) clamp to the end of the track.
         let millis = (position / MICROS_PER_MILLI).try_into().unwrap_or(u32::MAX);
         failed(self.spirc()?.set_position_ms(millis))
+    }
+}
+
+/// Whether the track shown is loaded here, so seeking and skipping work.
+fn controllable(playing: &playing::Shared) -> bool {
+    let playing = playing::lock(playing);
+    playing.here && playing.track.is_some()
+}
+
+/// Fails unless the playback is here: the track shown is one from before the
+/// service started, or plays on another device. Play brings it here.
+fn here(playing: &playing::Shared) -> fdo::Result<()> {
+    if playing::lock(playing).here {
+        Ok(())
+    } else {
+        Err(fdo::Error::Failed(
+            "the playback isn't here yet; play it first".into(),
+        ))
     }
 }
 

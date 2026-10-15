@@ -268,7 +268,8 @@ async fn live_reusable_credentials() {
 }
 
 /// Takes playback over from the running service with a second, silent speaker,
-/// as another Spotify app would: the service then reports Stopped. Holds for
+/// as another Spotify app would: the service then shows it as playing on
+/// another device. Plays it with `SPOTITUI_TAKEOVER_PLAY=1`. Holds for
 /// `SPOTITUI_TAKEOVER_SECS` (default 8) before leaving.
 #[tokio::test]
 #[ignore = "takes playback over from the running service"]
@@ -286,8 +287,16 @@ async fn live_take_over() {
         .await
         .expect("a second speaker");
     tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    connection.speaker.spirc().transfer(None).expect("transfer");
+    connection.speaker.take_over().await.expect("transfer");
     println!("took playback over");
+    if std::env::var("SPOTITUI_TAKEOVER_PLAY").is_ok_and(|play| play == "1") {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        connection
+            .speaker
+            .command(super::Command::Resume)
+            .expect("plays");
+        println!("playing");
+    }
     let hold = std::env::var("SPOTITUI_TAKEOVER_SECS")
         .ok()
         .and_then(|secs| secs.parse().ok())

@@ -1,12 +1,14 @@
-//! The tracks around the playing one (one before, three after), for the
-//! Omarchy bar widget, published to `$XDG_RUNTIME_DIR/spotitui/queue.json`.
+//! Spotify's playback as the account sees it, and the tracks around the playing
+//! one (one before, three after) for the Omarchy bar widget, published to
+//! `$XDG_RUNTIME_DIR/spotitui/queue.json`.
 //!
 //! Spotify's connect-state "cluster" carries the real play queue: previous
-//! tracks, shuffle order and queued tracks. Spotify only pushes it to devices
-//! that are *not* playing, so a second, hidden session registers as an observer
-//! the way the web player does ("hobs_" devices never show in device lists).
+//! tracks, shuffle order and queued tracks, and which device plays. Spotify only
+//! pushes it to devices that are *not* playing, so a second, hidden session
+//! registers as an observer the way the web player does ("hobs_" devices never
+//! show in device lists).
 
-use super::{Catalog, Error};
+use super::{Catalog, Error, Repeat};
 use futures_util::StreamExt;
 use librespot_core::{
     Session, SessionConfig, authentication::Credentials, dealer::protocol::Message,
@@ -20,7 +22,7 @@ use librespot_protocol::{
     player::{PlayerState, ProvidedTrack},
 };
 use protobuf::{EnumOrUnknown, Message as _, MessageField};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     path::PathBuf,
@@ -71,7 +73,7 @@ impl Observer {
 }
 
 /// A track in the published list.
-#[derive(Serialize, Clone, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct Entry {
     /// Place relative to the playing track: -1 before it, 0 playing, 1.. after it.
     pub offset: i32,
@@ -80,14 +82,36 @@ pub struct Entry {
     pub artist: String,
 }
 
-/// The queue around the playing track, as Spotify reports it.
+/// Spotify's playback and the queue around the playing track, as Spotify
+/// reports them. Without a device playing, they are what played last.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Around {
     pub context_uri: String,
     pub context_name: String,
     pub tracks: Vec<Entry>,
-    /// The whole play queue, for reordering it.
+    /// The whole play queue, for reordering it; `None` when Spotify has no track.
     pub queue: Option<LiveQueue>,
+    /// The device that plays, or is paused; `None` when none is.
+    pub device: Option<ActiveDevice>,
+    pub paused: bool,
+    /// Where the track is, as of the update.
+    pub position_ms: u32,
+    pub shuffle: bool,
+    pub repeat: Repeat,
+}
+
+/// The Spotify Connect device that has the playback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActiveDevice {
+    pub id: String,
+    pub name: String,
+}
+
+impl Around {
+    /// Whether a device other than `own` (a device ID) is playing.
+    pub fn plays_elsewhere(&self, own: &str) -> bool {
+        !self.paused && self.device.as_ref().is_some_and(|device| device.id != own)
+    }
 }
 
 /// The speaker's play queue as last reported: what `set_queue` needs to put a
@@ -102,10 +126,14 @@ pub struct LiveQueue {
     pub revision: String,
 }
 
-#[derive(Serialize)]
-struct Snapshot<'a> {
-    context: &'a str,
-    tracks: &'a [Entry],
+/// What the bar widget reads: the list, and what the service has to say.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct Feed {
+    /// What plays from, such as a playlist's name.
+    pub context: String,
+    pub tracks: Vec<Entry>,
+    /// Why nothing can play here right now, such as "offline"; empty while connected.
+    pub status: String,
 }
 
 /// Watches the play queue from a hidden observer session and calls `report`
@@ -265,7 +293,7 @@ async fn follow(
         // (Its track may not match the speaker's URI exactly: Spotify relinks
         // tracks to other copies for some countries.)
         behind_since = None;
-        let around = around(&cluster.player_state, catalog, &mut names).await;
+        let around = around(&cluster, catalog, &mut names).await;
         if last.as_ref() != Some(&around) {
             report(around.clone());
             last = Some(around);
@@ -320,16 +348,29 @@ pub(super) fn observer_id() -> String {
 }
 
 async fn around(
-    state: &MessageField<PlayerState>,
+    cluster: &Cluster,
     catalog: &Catalog,
     names: &mut HashMap<String, (String, String)>,
 ) -> Around {
-    let Some(state) = state.as_ref() else {
+    let device = (!cluster.active_device_id.is_empty()).then(|| ActiveDevice {
+        id: cluster.active_device_id.clone(),
+        name: cluster
+            .device
+            .get(&cluster.active_device_id)
+            .map(|device| device.name.clone())
+            .unwrap_or_default(),
+    });
+    let Some(state) = cluster.player_state.as_ref() else {
         return Around {
             context_uri: String::new(),
             context_name: String::new(),
             tracks: Vec::new(),
             queue: None,
+            device,
+            paused: true,
+            position_ms: 0,
+            shuffle: false,
+            repeat: Repeat::Off,
         };
     };
     let uris = neighbors(&state.prev_tracks, &state.track, &state.next_tracks);
@@ -377,7 +418,31 @@ async fn around(
             prev: state.prev_tracks.clone(),
             revision: state.queue_revision.clone(),
         }),
+        device,
+        // Spotify apps say "playing" for a paused track too, as having one.
+        paused: state.is_paused || !state.is_playing,
+        position_ms: position(state, cluster.server_timestamp_ms),
+        shuffle: state
+            .options
+            .as_ref()
+            .is_some_and(|options| options.shuffling_context),
+        repeat: state.options.as_ref().map_or(Repeat::Off, |options| {
+            Repeat::from_flags(options.repeating_context, options.repeating_track)
+        }),
     }
+}
+
+/// Where the track is at `now` (Spotify's clock, in ms): the last report, plus
+/// the time since while it plays. Never past the end.
+fn position(state: &PlayerState, now: i64) -> u32 {
+    let mut position = state.position_as_of_timestamp;
+    if state.is_playing && !state.is_paused {
+        position += (now - state.timestamp).max(0);
+    }
+    if state.duration > 0 {
+        position = position.min(state.duration);
+    }
+    u32::try_from(position.max(0)).unwrap_or(u32::MAX)
 }
 
 /// The playable tracks around the playing one, with their offsets.
@@ -431,12 +496,12 @@ fn playable(track: &ProvidedTrack) -> bool {
     track.uri.starts_with("spotify:track:") || track.uri.starts_with("spotify:episode:")
 }
 
-/// Publishes the list; `context` names what is playing, such as a playlist.
-pub fn write(context: &str, tracks: &[Entry]) {
+/// Publishes what the bar widget shows.
+pub fn write(feed: &Feed) {
     let Some(path) = file() else {
         return;
     };
-    let Ok(json) = serde_json::to_vec_pretty(&Snapshot { context, tracks }) else {
+    let Ok(json) = serde_json::to_vec_pretty(feed) else {
         return;
     };
     if let Some(parent) = path.parent() {
@@ -449,7 +514,7 @@ pub fn write(context: &str, tracks: &[Entry]) {
     }
 }
 
-/// Removes the published list; the widget then knows nothing plays here.
+/// Removes the published list, as the service stops.
 pub fn clear() {
     if let Some(path) = file() {
         let _ = std::fs::remove_file(path);
@@ -463,7 +528,30 @@ fn file() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Around, LiveQueue, MessageField, ProvidedTrack, neighbors, observer_id, shows};
+    use super::{
+        ActiveDevice, Around, LiveQueue, MessageField, PlayerState, ProvidedTrack, Repeat,
+        neighbors, observer_id, position, shows,
+    };
+
+    fn around(current: &str) -> Around {
+        Around {
+            context_uri: String::new(),
+            context_name: String::new(),
+            tracks: Vec::new(),
+            queue: Some(LiveQueue {
+                context_uri: String::new(),
+                current_uri: current.into(),
+                next: Vec::new(),
+                prev: Vec::new(),
+                revision: String::new(),
+            }),
+            device: None,
+            paused: true,
+            position_ms: 0,
+            shuffle: false,
+            repeat: Repeat::Off,
+        }
+    }
 
     fn track(uri: &str) -> ProvidedTrack {
         ProvidedTrack {
@@ -493,18 +581,6 @@ mod tests {
 
     #[test]
     fn the_observer_is_behind_until_its_queue_shows_the_playing_track() {
-        let around = |current: &str| Around {
-            context_uri: String::new(),
-            context_name: String::new(),
-            tracks: Vec::new(),
-            queue: Some(LiveQueue {
-                context_uri: String::new(),
-                current_uri: current.into(),
-                next: Vec::new(),
-                prev: Vec::new(),
-                revision: String::new(),
-            }),
-        };
         assert!(shows(None, None), "nothing plays, nothing to show");
         assert!(!shows(None, Some("spotify:track:a")));
         assert!(!shows(Some(&around("spotify:track:a")), Some("spotify:track:b")));
@@ -535,6 +611,36 @@ mod tests {
         assert_eq!(target("spotify:track:a", 9), None, "beyond the known queue");
         assert_eq!(target("spotify:track:z", 1), None, "a queue about something else");
         assert_eq!(target("spotify:track:a", 0), None);
+    }
+
+    #[test]
+    fn positions_move_on_only_while_playing_and_stay_in_the_track() {
+        let state = |playing: bool, paused: bool| PlayerState {
+            timestamp: 10_000,
+            position_as_of_timestamp: 30_000,
+            duration: 200_000,
+            is_playing: playing,
+            is_paused: paused,
+            ..PlayerState::default()
+        };
+        assert_eq!(position(&state(true, false), 15_000), 35_000);
+        // Spotify apps report a paused track as playing and paused.
+        assert_eq!(position(&state(true, true), 15_000), 30_000);
+        assert_eq!(position(&state(true, false), 10_000_000), 200_000, "never past the end");
+    }
+
+    #[test]
+    fn only_another_device_playing_is_elsewhere() {
+        let mut playback = around("spotify:track:a");
+        assert!(!playback.plays_elsewhere("me"), "no device has it");
+        playback.device = Some(ActiveDevice {
+            id: "phone".into(),
+            name: "Pixel".into(),
+        });
+        assert!(!playback.plays_elsewhere("me"), "paused there");
+        playback.paused = false;
+        assert!(playback.plays_elsewhere("me"));
+        assert!(!playback.plays_elsewhere("phone"), "it's this one");
     }
 
     #[test]

@@ -91,7 +91,9 @@ pub enum Status {
     Paused,
 }
 
-/// The speaker's playback, as its events describe it.
+/// The speaker's playback, as its events describe it. While the speaker isn't
+/// Spotify's player, it is the playback shown instead: what played last, or
+/// what another device plays, paused here until brought here.
 #[derive(Clone, Debug)]
 pub struct Playing {
     pub track: Option<NowTrack>,
@@ -100,6 +102,9 @@ pub struct Playing {
     pub volume: u16,
     pub shuffle: bool,
     pub repeat: Repeat,
+    /// Whether the speaker is Spotify's player, so it takes commands. False
+    /// while the track shown is one from before, or from another device.
+    pub here: bool,
 }
 
 /// The record the service and MPRIS share.
@@ -125,11 +130,33 @@ impl Playing {
             volume,
             shuffle: false,
             repeat: Repeat::Off,
+            here: false,
         }
     }
 
     pub fn playing(&self) -> bool {
         self.status == Status::Playing
+    }
+
+    /// Shows a track that isn't loaded here, paused `position_ms` in.
+    pub fn show(&mut self, track: NowTrack, position_ms: u32, shuffle: bool, repeat: Repeat) {
+        self.clock.restart(Duration::from_millis(track.duration_ms));
+        self.clock
+            .report(Duration::from_millis(position_ms.into()), false);
+        self.track = Some(track);
+        self.status = Status::Paused;
+        self.shuffle = shuffle;
+        self.repeat = repeat;
+        self.here = false;
+    }
+
+    /// The speaker is gone: its track stays shown, paused where it got to.
+    pub fn leave(&mut self) {
+        self.here = false;
+        self.clock.set_running(false);
+        if self.track.is_some() {
+            self.status = Status::Paused;
+        }
     }
 
     /// Spotify sometimes plays another copy of a track than the one listed (a
@@ -214,6 +241,15 @@ impl Playing {
                 PlayerUpdate::Repeat(self.repeat)
             }
             PlayerEvent::Unavailable { .. } => PlayerUpdate::Unavailable,
+            // The speaker became Spotify's player, or another device took over.
+            PlayerEvent::SessionConnected { .. } => {
+                self.here = true;
+                return None;
+            }
+            PlayerEvent::SessionDisconnected { .. } => {
+                self.here = false;
+                return None;
+            }
             _ => return None,
         })
     }
@@ -303,6 +339,36 @@ mod tests {
         let corrected = playing.relink(&event).expect("relinked");
         assert_eq!(corrected.uri, "spotify:track:32dnKMni3I3gwUbWp4mi45");
         assert!(playing.relink(&event).is_none(), "once is enough");
+    }
+
+    #[test]
+    fn a_track_shown_takes_commands_once_the_speaker_has_the_playback() {
+        let mut playing = Playing::new(0);
+        playing.show(
+            crate::spotify::NowTrack {
+                uri: "spotify:track:4uLU6hMCjMI75M1A2tKUQC".into(),
+                name: "Never Gonna Give You Up".into(),
+                artists: Vec::new(),
+                album: String::new(),
+                album_artists: Vec::new(),
+                duration_ms: 213_573,
+                art_url: None,
+            },
+            60_000,
+            true,
+            crate::spotify::Repeat::Off,
+        );
+        assert_eq!((playing.status, playing.here), (Status::Paused, false));
+        assert_eq!(playing.clock.elapsed_ms(), 60_000);
+        let connected = PlayerEvent::SessionConnected {
+            connection_id: String::new(),
+            user_name: String::new(),
+        };
+        assert_eq!(playing.apply(&connected), None, "windows don't hear of it");
+        assert!(playing.here);
+        playing.leave();
+        assert_eq!((playing.status, playing.here), (Status::Paused, false));
+        assert!(playing.track.is_some(), "still shown");
     }
 
     #[test]

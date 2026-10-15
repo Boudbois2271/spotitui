@@ -137,12 +137,25 @@ notch) with the wheel.
   own, which keeps foot's transparency.
 - **Media keys:** MPRIS as `org.mpris.MediaPlayer2.spotitui`, so the
   `XF86Audio*` keys (`omarchy-shell media …`) and `playerctl -p spotitui`
-  work. Covers are downloaded to `$XDG_RUNTIME_DIR/spotitui/covers/` and
+  work. Covers are downloaded to `~/.cache/spotitui/covers/` and
   published as `file://` URLs (loading https covers crashed the Omarchy shell).
   Beside MPRIS, the same object serves `io.spotitui.Queue.Skip(offset)`: it
   plays the track `offset` places away in the play order (`-1` goes to the
   previous track even mid-song, at most 20 either way), which the bar widget's
   list uses.
+- **Resume:** the service picks up where you left off, paused. It starts showing
+  what played last (kept in `~/.local/state/spotitui/last.json`, with its cover
+  in the cache), so the bar widget and MPRIS have a track before Spotify is
+  reached, or while offline. Once connected, it asks Spotify to hand its
+  playback over, as choosing a device in another Spotify app does: what played
+  last anywhere (a later play on your phone wins), with its playlist or album,
+  queue, shuffle order, repeat and position. Play (`Space`, the media keys, the
+  widget) then resumes it; pressed while still connecting, it plays once the
+  track is back. A device that is *playing* is never interrupted; Play brings
+  its playback here. If Spotify has nothing to hand over, the track saved here
+  is loaded again. After a crash or power cut,
+  which Spotify records as still playing, the track comes back paused at the
+  position saved here (every 15 s while playing).
 - **Single instance:** one service per user (a second one exits); any number
   of windows can connect to it.
 - **Lyrics:** Spotify's own (usually Musixmatch, line-synced). When Spotify has
@@ -150,7 +163,9 @@ notch) with the wheel.
   [LRCLIB](https://lrclib.net).
 - **Bar widget:** the tracks around the playing one (one before, three after)
   are written to `$XDG_RUNTIME_DIR/spotitui/queue.json` for the
-  `boudbois.spotify` Omarchy bar widget, and removed on exit. They come from
+  `boudbois.spotify` Omarchy bar widget, with the service's status
+  (`connecting`, `offline`, `logged out`…); the file is removed on exit. The
+  tracks come from
   Spotify's connect-state cluster, read by a second, hidden "observer" session
   (a `hobs_` device, as the web player uses), because Spotify doesn't send the
   cluster to the device that is playing. **Play next** (`Z`) uses that queue
@@ -212,6 +227,9 @@ won't take it, and retries saving it every minute and when stopping.
 
 ## Limitations
 
+- After it starts, spotitui is Spotify's active device, paused, so other Spotify
+  apps show it as the device to play on (as they do after you listened here)
+  until you pick another one in them.
 - spotitui logs in as Spotify's own desktop app (librespot's client ID): Spotify
   streams audio only to its privileged clients, so a client ID of your own can't
   play. Spotify could restrict that ID at any time, as it could for every

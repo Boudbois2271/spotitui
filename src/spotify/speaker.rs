@@ -8,7 +8,10 @@ use librespot_connect::{
     ConnectConfig, LoadContextOptions, LoadRequest, LoadRequestOptions, Options, PlayingTrack,
     Spirc,
 };
-use librespot_core::{Session, SessionConfig, authentication::Credentials, config::DeviceType};
+use librespot_core::{
+    Session, SessionConfig, authentication::Credentials, config::DeviceType,
+    dealer::protocol::TransferOptions, spclient::TransferRequest,
+};
 use librespot_playback::{
     audio_backend,
     config::{AudioFormat, PlayerConfig},
@@ -31,6 +34,7 @@ pub struct Speaker {
     spirc: Arc<Spirc>,
     session: Session,
     mixer: Arc<MuteMixer>,
+    player: Arc<Player>,
 }
 
 /// librespot's software volume with a mute switch of its own. Muting silences
@@ -143,15 +147,26 @@ impl Speaker {
     }
 
     pub fn play(&self, play: Play, mode: Mode) -> Result<(), Error> {
+        self.load(play, mode, true, 0)
+    }
+
+    /// Loads a track within its list, `position_ms` in, playing or paused.
+    pub fn load(
+        &self,
+        play: Play,
+        mode: Mode,
+        start_playing: bool,
+        position_ms: u32,
+    ) -> Result<(), Error> {
         let options = |track| LoadRequestOptions {
-            start_playing: true,
+            start_playing,
+            seek_to: position_ms,
             playing_track: Some(PlayingTrack::Uri(track)),
             context_options: Some(LoadContextOptions::Options(Options {
                 shuffle: mode.shuffle,
                 repeat: mode.repeat != Repeat::Off,
                 repeat_track: mode.repeat == Repeat::Track,
             })),
-            ..LoadRequestOptions::default()
         };
         let request = match play {
             Play::Context { uri, track } => LoadRequest::from_context_uri(uri, options(track)),
@@ -160,6 +175,35 @@ impl Speaker {
         // A speaker ignores commands until it is the active device; activating it again is harmless.
         self.spirc.activate()?;
         Ok(self.spirc.load(request)?)
+    }
+
+    /// Asks Spotify to hand its playback over to this speaker, paused, as
+    /// choosing a device in another Spotify app does: what plays on another
+    /// device, or else what played last anywhere, with its list, queue and
+    /// shuffle order. Spotify answers once the speaker has taken it.
+    ///
+    /// Not through `Spirc::transfer`: Spirc waits for that answer in its own
+    /// loop, so it can't take the playback Spotify sends it meanwhile; after 3
+    /// seconds Spotify gives up, drops the connection and answers 410 Gone.
+    pub fn take_over(&self) -> impl Future<Output = Result<(), Error>> + Send + 'static {
+        let session = self.session.clone();
+        async move {
+            run(async move {
+                let request = TransferRequest {
+                    transfer_options: TransferOptions {
+                        restore_paused: Some("pause".into()),
+                        ..TransferOptions::default()
+                    },
+                };
+                let device = session.device_id().to_owned();
+                session
+                    .spclient()
+                    .transfer(&device, &device, Some(&request))
+                    .await?;
+                Ok(())
+            })
+            .await
+        }
     }
 
     pub fn command(&self, command: Command) -> Result<(), Error> {
@@ -185,6 +229,13 @@ impl Speaker {
 
     pub fn set_muted(&self, muted: bool) {
         self.mixer.set_muted(muted);
+    }
+
+    /// Moves the track Spirc is loading to `position_ms`: the player loads it
+    /// from there, and says so when loaded. Spirc's own seek can't yet: it
+    /// refuses positions past the length, unknown until the track is loaded.
+    pub fn start_at(&self, position_ms: u32) {
+        self.player.seek(position_ms);
     }
 
     /// Skips ahead to a track of the play queue with a single load, however far
@@ -224,6 +275,28 @@ impl Speaker {
         async move { run(play_next(session, track, queue)).await }
     }
 
+    /// Puts back the tracks before and after the playing one as `saved` had
+    /// them, in place of the queue named `revision`.
+    pub fn restore_queue(
+        &self,
+        saved: super::queue::LiveQueue,
+        revision: String,
+    ) -> impl Future<Output = Result<(), Error>> + Send + 'static {
+        let session = self.session.clone();
+        async move {
+            run(async move {
+                set_queue(
+                    &session,
+                    as_json(&saved.next)?,
+                    as_json(&saved.prev)?,
+                    &revision,
+                )
+                .await
+            })
+            .await
+        }
+    }
+
     /// Adds a track after the playing one and any tracks queued before it.
     pub fn queue(&self, track: String) -> impl Future<Output = Result<(), Error>> + Send + 'static {
         let session = self.session.clone();
@@ -259,6 +332,7 @@ async fn start(
         move || backend(None, AudioFormat::default()),
     );
     let events = player.get_player_event_channel();
+    let handle = player.clone();
     let config = ConnectConfig {
         name: DEVICE_NAME.into(),
         device_type: DeviceType::Computer,
@@ -276,6 +350,7 @@ async fn start(
             spirc,
             session: session.clone(),
             mixer,
+            player: handle,
         },
         events,
         catalog,
@@ -315,26 +390,39 @@ async fn play_next(
     let Some(queue) = queue.filter(|_| queued_ahead) else {
         return add_to_queue(session, track).await;
     };
-    let as_json = |tracks: &[ProvidedTrack]| -> Result<Vec<serde_json::Value>, Error> {
-        tracks
-            .iter()
-            .map(|track| {
-                let text = protobuf_json_mapping::print_to_string(track)
-                    .map_err(|error| Error::Response(error.to_string()))?;
-                Ok(serde_json::from_str(&text)?)
-            })
-            .collect()
-    };
     let mut next = vec![queued(&track)];
     next.extend(as_json(&queue.next)?);
+    set_queue(&session, next, as_json(&queue.prev)?, &queue.revision).await
+}
+
+/// Replaces the tracks before and after the playing one, as the phone app
+/// reorders the queue. `revision` names the queue replaced.
+async fn set_queue(
+    session: &Session,
+    next: Vec<serde_json::Value>,
+    prev: Vec<serde_json::Value>,
+    revision: &str,
+) -> Result<(), Error> {
     let command = serde_json::json!({
         "endpoint": "set_queue",
         "next_tracks": next,
-        "prev_tracks": as_json(&queue.prev)?,
-        "queue_revision": queue.revision,
+        "prev_tracks": prev,
+        "queue_revision": revision,
         "logging_params": {},
     });
-    send_command(&session, command).await
+    send_command(session, command).await
+}
+
+/// Tracks as Spotify's JSON commands carry them.
+fn as_json(tracks: &[ProvidedTrack]) -> Result<Vec<serde_json::Value>, Error> {
+    tracks
+        .iter()
+        .map(|track| {
+            let text = protobuf_json_mapping::print_to_string(track)
+                .map_err(|error| Error::Response(error.to_string()))?;
+            Ok(serde_json::from_str(&text)?)
+        })
+        .collect()
 }
 
 /// Sends a player command to this speaker through Spotify, as remote apps do.
