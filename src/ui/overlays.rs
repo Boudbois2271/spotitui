@@ -28,7 +28,7 @@ enum HelpRow {
 
 const HELP: &[HelpRow] = &[
     HelpRow::Section("PLAYBACK"),
-    HelpRow::Keys("Space", "play / pause", "n / p", "next / previous"),
+    HelpRow::Keys("Space", "play / pause", "- / =", "previous / next"),
     HelpRow::Keys("b / w", "seek 10 seconds", "s / r", "shuffle / repeat"),
     HelpRow::Keys("[ / ]", "volume down / up", "m", "mute"),
     HelpRow::Blank,

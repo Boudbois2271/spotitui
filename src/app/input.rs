@@ -96,12 +96,11 @@ impl App {
         }
         match key.code {
             KeyCode::Char(' ') => self.act(Action::TogglePlay),
-            KeyCode::Char('n') => self.act(Action::Next),
-            KeyCode::Char('p') => self.act(Action::Previous),
+            // The same keys as the desktop shortcuts (SUPER + - / =).
+            KeyCode::Char('=') => self.act(Action::Next),
+            KeyCode::Char('-') => self.act(Action::Previous),
             KeyCode::Char('w') => self.seek_by(true),
             KeyCode::Char('b') => self.seek_by(false),
-            KeyCode::Char('+' | '=') => self.change_volume(true),
-            KeyCode::Char('-') => self.change_volume(false),
             KeyCode::Char('s') => self.act(Action::Shuffle),
             KeyCode::Char('m') => self.toggle_mute(),
             KeyCode::Char('r') => self.act(Action::Repeat),
@@ -408,7 +407,7 @@ impl App {
 fn is_playback_key(code: KeyCode) -> bool {
     matches!(
         code,
-        KeyCode::Char(' ' | 'n' | 'p' | 'w' | 'b' | '[' | ']' | '+' | '=' | '-' | 'm' | 's' | 'r')
+        KeyCode::Char(' ' | '=' | '-' | 'w' | 'b' | '[' | ']' | 'm' | 's' | 'r')
     )
 }
 
