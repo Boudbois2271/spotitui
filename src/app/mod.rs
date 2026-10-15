@@ -36,6 +36,9 @@ const SEEK_STEP: Duration = Duration::from_secs(10);
 const THEME_POLL_TICKS: u64 = 4;
 /// Playlists load again on entering the sidebar, at most this often.
 const PLAYLISTS_REFRESH: Duration = Duration::from_secs(30);
+/// The list on screen loads again on entering it from the sidebar, or after
+/// a reconnection, if it was listed longer ago than this.
+const LIST_REFRESH: Duration = Duration::from_secs(30);
 /// The fixed sidebar entries before the playlists: Search, Liked Songs, Recently played.
 pub const FIXED_SHELVES: usize = 3;
 
@@ -138,6 +141,11 @@ pub enum Msg {
     LoginFailed(Failure),
     Playlists(Result<Vec<Playlist>, Failure>),
     Uris {
+        generation: u64,
+        result: Result<Vec<String>, Failure>,
+    },
+    /// The list on screen, listed again in the background.
+    Refreshed {
         generation: u64,
         result: Result<Vec<String>, Failure>,
     },
@@ -328,6 +336,7 @@ impl App {
                 Ok(uris) => {
                     self.listing.uris = uris.into();
                     self.listing.loading = Loading::Idle;
+                    self.listing.loaded_at = Some(Instant::now());
                     self.load_more();
                 }
                 Err(error) => self.listing.fail(error),
@@ -350,6 +359,14 @@ impl App {
             },
             // Results for a list the user already left.
             Msg::Uris { .. } | Msg::Tracks { .. } => {}
+            Msg::Refreshed {
+                generation,
+                result: Ok(uris),
+            } if generation == self.generation && self.listing.loading == Loading::Idle => {
+                self.refreshed(uris);
+            }
+            // A failure keeps the list as it was; so does leaving it meanwhile.
+            Msg::Refreshed { .. } => {}
             Msg::Lyrics { uri, result } => self.lyrics_arrived(uri, result),
             Msg::Notice { text, error } => self.notify(text, error),
             Msg::Liked(track) => self.liked_added(Rc::new(track)),
@@ -403,6 +420,7 @@ impl App {
                     // and a list that failed loads again.
                     self.load_playlists();
                     self.retry();
+                    self.refresh();
                     if self.view == View::Lyrics {
                         self.ensure_lyrics();
                     }
@@ -565,6 +583,53 @@ impl App {
         });
     }
 
+    /// Lists the list on screen again in the background, if it was listed a
+    /// while ago: songs saved or added in another Spotify app show up. Its rows
+    /// stay on screen meanwhile, and the highlighted track stays highlighted.
+    fn refresh(&mut self) {
+        let stale = self
+            .listing
+            .loaded_at
+            .is_some_and(|at| at.elapsed() >= LIST_REFRESH);
+        if !stale
+            || self.listing.loading != Loading::Idle
+            || matches!(self.listing.source, Source::Search(_))
+        {
+            return;
+        }
+        // One at a time. Moving to another list (or loading more rows) moves
+        // the generation on, and this answer is dropped.
+        self.listing.loaded_at = Some(Instant::now());
+        let generation = self.generation;
+        let target = Target::of(self.liked_uri.as_deref(), &self.listing.source);
+        let (tx, service) = (self.tx.clone(), self.service.clone());
+        tokio::spawn(async move {
+            let result = target.resolve(&service).await;
+            let _ = tx.send(Msg::Refreshed { generation, result });
+        });
+    }
+
+    /// Takes the list on screen listed again: if it changed, its rows follow,
+    /// with the highlighted track still highlighted wherever it moved.
+    fn refreshed(&mut self, uris: Vec<String>) {
+        let Some(listing) = self.listing.refreshed(uris) else {
+            self.listing.loaded_at = Some(Instant::now());
+            return;
+        };
+        log::info!("{} changed; showing it afresh", listing.source.title());
+        let highlighted = self.selected().map(|track| track.uri.clone());
+        // Rows on their way belong to the list before.
+        self.generation += 1;
+        self.listing = listing;
+        let index = highlighted
+            .and_then(|uri| self.listing.uris.iter().position(|listed| *listed == uri))
+            .unwrap_or(self.window.selected);
+        self.to_end = false;
+        self.window.select(index, self.listing.uris.len());
+        self.refilter();
+        self.load_more();
+    }
+
     /// Loads the details of the next tracks, if the window is close to the loaded end.
     pub fn load_more(&mut self) {
         if self.listing.retry_due() {
@@ -645,8 +710,10 @@ impl App {
             self.open_shelf(index);
             return;
         }
-        // Entering a list that failed to load tries again.
+        // Entering a list that failed to load tries again; one listed a while
+        // ago is listed again, as it may have changed elsewhere.
         self.retry();
+        self.refresh();
         self.sidebar.select(index, self.shelf_count());
         self.view = View::Tracks;
         self.focus = match &self.listing.source {

@@ -7,7 +7,7 @@ use crate::{
     spotify::{Album, Artist, Playlist, Track},
 };
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     ops::Range,
     rc::Rc,
     time::{Duration, Instant},
@@ -44,6 +44,9 @@ pub struct Listing {
     pub tracks: Vec<Rc<Track>>,
     pub requested: usize,
     pub loading: Loading,
+    /// When its tracks were last listed, to know whether they may have
+    /// changed elsewhere since.
+    pub loaded_at: Option<Instant>,
     /// When the last failure happened, and how many failed in a row.
     failed_at: Option<Instant>,
     failures: u32,
@@ -156,9 +159,38 @@ impl Listing {
             tracks: Vec::new(),
             requested: 0,
             loading: Loading::Busy,
+            loaded_at: None,
             failed_at: None,
             failures: 0,
         }
+    }
+
+    /// The list as Spotify lists it now, if that differs: the rows already
+    /// loaded stay as far as the order is the same, the rest load as they come
+    /// into view. `None` when nothing changed.
+    pub fn refreshed(&self, uris: Vec<String>) -> Option<Listing> {
+        if *self.uris == *uris {
+            return None;
+        }
+        let known: HashMap<&str, &Rc<Track>> = self
+            .tracks
+            .iter()
+            .map(|track| (track.uri.as_str(), track))
+            .collect();
+        let tracks: Vec<Rc<Track>> = uris
+            .iter()
+            .map_while(|uri| known.get(uri.as_str()).map(|track| Rc::clone(track)))
+            .collect();
+        Some(Listing {
+            source: self.source.clone(),
+            requested: tracks.len(),
+            tracks,
+            uris: uris.into(),
+            loading: Loading::Idle,
+            loaded_at: Some(Instant::now()),
+            failed_at: None,
+            failures: 0,
+        })
     }
 
     /// Puts a track first, as Liked Songs lists the latest saved first. Returns
@@ -304,6 +336,25 @@ mod tests {
         // A late answer for an older position is ignored.
         listing.take_chunk(0, &chunk, vec![track("spotify:track:0")]);
         assert_eq!(listing.tracks.len(), 5);
+    }
+
+    #[test]
+    fn a_refreshed_list_keeps_the_rows_it_can() {
+        let mut old = listing(4);
+        let chunk: Vec<String> = old.uris[..3].to_vec();
+        old.requested = 3;
+        old.take_chunk(0, &chunk, chunk.iter().map(|uri| track(uri)).collect());
+        assert!(old.refreshed(old.uris.to_vec()).is_none(), "nothing changed");
+        // Added at the end, as to a playlist: every loaded row stays.
+        let mut longer = old.uris.to_vec();
+        longer.push("spotify:track:new".into());
+        let appended = old.refreshed(longer).expect("changed");
+        assert_eq!((appended.tracks.len(), appended.requested, appended.uris.len()), (3, 3, 5));
+        // Saved first, as to Liked Songs: its row isn't known, so rows load again.
+        let mut first = vec!["spotify:track:new".to_owned()];
+        first.extend(old.uris.iter().cloned());
+        let prepended = old.refreshed(first).expect("changed");
+        assert_eq!((prepended.tracks.len(), prepended.uris.len()), (0, 5));
     }
 
     #[test]

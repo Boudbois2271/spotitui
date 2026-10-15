@@ -188,6 +188,9 @@ notch) with the wheel.
   once per session and keeps it current with the collection's changes, so `S`
   costs one small request. Playlists load again when you enter the sidebar (at
   most every 30 s), and a song saved with `S` shows at the top of Liked Songs.
+  The list on screen loads again when you enter it from the sidebar (`l`) or
+  after a reconnection, if it was listed over 30 s before: songs saved or added
+  in another Spotify app show up, and the highlighted song stays highlighted.
 - **Recovery:** every network request has a time limit; a list that failed to
   load tries again by itself, and `l` on it retries at once. The service exits
   with an error if one of its own tasks crashes, so systemd restarts it. After a
