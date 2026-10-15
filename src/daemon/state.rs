@@ -49,6 +49,9 @@ pub struct State {
     /// When Play was asked for while the playback wasn't here yet; it plays
     /// once it's here, if that's soon.
     pub pending_play: Option<Instant>,
+    /// Where the last session was when it lost its connection to Spotify;
+    /// the next session takes the playback back from there.
+    pub lost: Option<Lost>,
     /// When the speaker last asked to take Spotify's playback over.
     pub taking_over: Option<Instant>,
     /// Where to go once the playback taken over is here, if not where Spotify says.
@@ -63,6 +66,17 @@ pub struct State {
     pub adopt_options: bool,
     /// The playback last saved, so the same isn't written again.
     last_saved: Option<Last>,
+}
+
+/// Where a session was when its connection was lost. Spotify can't be asked
+/// where the track stopped: on a lost connection librespot reports a paused
+/// track as having moved on through the time it sat paused.
+#[derive(Clone, Debug)]
+pub struct Lost {
+    pub at: Instant,
+    pub track: String,
+    pub position_ms: u32,
+    pub playing: bool,
 }
 
 /// What played last, kept in `~/.local/state/spotitui/last.json`: shown as soon
@@ -118,6 +132,7 @@ impl State {
             feed: Feed::default(),
             context_uri: String::new(),
             pending_play: None,
+            lost: None,
             taking_over: None,
             restore_seek: None,
             restore_queue: None,
@@ -166,6 +181,7 @@ impl State {
         self.feed = Feed::default();
         self.context_uri.clear();
         self.pending_play = None;
+        self.lost = None;
         self.taking_over = None;
         self.last_saved = None;
     }
@@ -194,6 +210,24 @@ impl State {
             shuffle: playing.shuffle,
             repeat: playing.repeat,
         }
+    }
+
+    /// Whether the session's connection to Spotify is up.
+    pub fn connected(&self) -> bool {
+        self.live
+            .as_ref()
+            .is_some_and(|live| !live.catalog.session().is_invalid())
+    }
+
+    /// Where the speaker is now, as its connection was just lost.
+    pub fn whereabouts(&self) -> Option<Lost> {
+        let playing = self.playing();
+        Some(Lost {
+            at: Instant::now(),
+            track: playing.track.as_ref()?.uri.clone(),
+            position_ms: playing.clock.elapsed_ms(),
+            playing: playing.playing(),
+        })
     }
 
     /// Ends the session's playback state. The track stays shown, paused, until

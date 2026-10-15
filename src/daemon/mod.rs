@@ -60,6 +60,9 @@ const RESTORE_WAIT: Duration = Duration::from_secs(10);
 /// Play asked for while the playback isn't here plays it once it is, if that
 /// is within this; later, music would start out of the blue.
 const PENDING_PLAY: Duration = Duration::from_secs(15);
+/// A track cut short by a lost connection plays on if the connection is
+/// back within this; later, music would start out of the blue.
+const PLAY_ON: Duration = Duration::from_secs(60);
 /// How long a take-over may take before another one is asked for.
 const TAKE_OVER_WAIT: Duration = Duration::from_secs(5);
 /// How often the position is saved while playing, for after a power cut.
@@ -758,7 +761,10 @@ impl Daemon {
     /// While the playback isn't here, shows Spotify's instead: what another
     /// device plays, or what played last anywhere. Not before the session has
     /// decided whether to bring it back: until then, the track shown is the
-    /// one saved here, and the position to bring back with it.
+    /// one saved here, and the position to bring back with it. Nor once the
+    /// connection is lost (librespot then says the speaker left, and Spotify
+    /// hears a paused track moved on): what played stays shown as it was, for
+    /// the next session to pick up.
     async fn mirror(&self, around: Around) {
         let Some(uri) = around.queue.as_ref().map(|queue| queue.current_uri.clone()) else {
             return;
@@ -766,7 +772,7 @@ impl Daemon {
         let shown = {
             let state = self.state();
             let playing = state.playing();
-            if playing.here || !state.restored {
+            if playing.here || !state.restored || !state.connected() {
                 return;
             }
             playing.track.clone().filter(|track| track.uri == uri)
@@ -796,7 +802,7 @@ impl Daemon {
                 .as_ref()
                 .and_then(|around| around.queue.as_ref())
                 .is_some_and(|queue| queue.current_uri == uri);
-            if playing.here || !state.restored || !current {
+            if playing.here || !state.restored || !state.connected() || !current {
                 return;
             }
             let before = (playing.shuffle, playing.repeat);
@@ -1001,12 +1007,13 @@ async fn bring_back(daemon: &Daemon, own: &str) -> bool {
     let Some(around) = around else {
         return false;
     };
-    let (here, asked) = {
-        let state = daemon.state();
+    let (here, asked, lost) = {
+        let mut state = daemon.state();
         let asked = state
             .pending_play
             .is_some_and(|asked| asked.elapsed() < PENDING_PLAY);
-        (state.playing().here, asked)
+        let lost = state.lost.take();
+        (state.playing().here, asked, lost)
     };
     // A window, or another Spotify app, started something meanwhile.
     if here {
@@ -1017,10 +1024,23 @@ async fn bring_back(daemon: &Daemon, own: &str) -> bool {
         log::info!("{name} is playing; leaving the playback there");
         return false;
     }
+    // The last session lost its connection, and no other device took the
+    // playback since: back to where it stopped, playing on if it played a
+    // moment ago.
+    let untouched = around.device.as_ref().is_none_or(|device| device.id == own);
+    let current = around.queue.as_ref().map(|queue| queue.current_uri.as_str());
+    if let Some(lost) = lost.filter(|lost| untouched && current == Some(lost.track.as_str())) {
+        let mut state = daemon.state();
+        state.restore_seek = Some(lost.position_ms);
+        if lost.playing && lost.at.elapsed() < PLAY_ON {
+            log::info!("the connection is back; playing on");
+            state.pending_play = Some(std::time::Instant::now());
+        }
+    }
     // Spotify says it plays, with no device playing it: the player died, as
     // in a crash or power cut. It reckons the position on through the time
     // since; the one saved here is closer, if it's the same track.
-    if !around.paused
+    else if !around.paused
         && let Some(last) = state::saved_last()
         && around
             .queue
@@ -1293,7 +1313,14 @@ async fn run_session(daemon: &Arc<Daemon>, connection: Connection) {
     daemon.cluster.send_replace(None);
     set_slot(&daemon.slot, None);
     let paused_at = {
-        let state = daemon.state();
+        let mut state = daemon.state();
+        // A session asked to end (a login) starts afresh; one that lost its
+        // connection leaves where it was for the next.
+        state.lost = if session_ended {
+            state.whereabouts()
+        } else {
+            None
+        };
         let playing = state.playing();
         (playing.status == spotify::playing::Status::Paused).then(|| playing.clock.elapsed_ms())
     };

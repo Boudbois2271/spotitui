@@ -190,9 +190,12 @@ notch) with the wheel.
   most every 30 s), and a song saved with `S` shows at the top of Liked Songs.
 - **Recovery:** every network request has a time limit; a list that failed to
   load tries again by itself, and `l` on it retries at once. The service exits
-  with an error if one of its own tasks crashes, so systemd restarts it. When it
-  stops it tells Spotify the device is leaving, and it keeps one device ID per
-  computer, so other apps see the same spotitui across restarts.
+  with an error if one of its own tasks crashes, so systemd restarts it. After a
+  lost connection the playback comes back where it stopped, and a track that was
+  playing plays on if the connection is back within a minute (unless another
+  device took the playback meanwhile). When it stops it tells Spotify the device
+  is leaving, and it keeps one device ID per computer, so other apps see the same
+  spotitui across restarts.
 - **Volume** is remembered in `~/.local/state/spotitui/volume`. **Mute** (`m`) is a
   status of its own, kept in `~/.local/state/spotitui/muted`: it silences the output
   without touching the volume, which Spotify Connect and MPRIS keep showing. Volume
