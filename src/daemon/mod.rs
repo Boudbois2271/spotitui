@@ -459,6 +459,27 @@ impl Daemon {
             self.resume().await?;
             return Ok(Response::Done);
         }
+        // The speaker ignores these until it is Spotify's player: say so,
+        // rather than doing nothing.
+        let here = self.state().playing().here;
+        match command {
+            // Nothing plays here; a Play on its way is called off.
+            Command::Pause if !here => {
+                self.state().pending_play = None;
+                return Ok(Response::Done);
+            }
+            Command::Next
+            | Command::Previous
+            | Command::Seek(_)
+            | Command::Shuffle(_)
+            | Command::Repeat(_)
+                if !here =>
+            {
+                self.speaker()?;
+                return Err(self.not_here());
+            }
+            _ => {}
+        }
         if command == Command::Next {
             // Gathered with other quick skips; said at once if there's no speaker.
             self.speaker()?;
@@ -481,6 +502,17 @@ impl Daemon {
             .command(command)
             .map_err(|error| failure(&error))?;
         Ok(Response::Done)
+    }
+
+    /// Why a command can't work while the playback isn't here.
+    fn not_here(&self) -> Failure {
+        let device = self.state().feed.device.clone();
+        let message = if device.is_empty() {
+            "The playback isn't here yet; Play brings it here".to_owned()
+        } else {
+            format!("The music is on {device}; Play brings it here")
+        };
+        Failure::new(Kind::Other, message)
     }
 
     /// Skips `count` tracks forward now: one is librespot's own "next"; more
