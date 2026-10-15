@@ -98,8 +98,8 @@ impl App {
             KeyCode::Char(' ') => self.act(Action::TogglePlay),
             KeyCode::Char('n') => self.act(Action::Next),
             KeyCode::Char('p') => self.act(Action::Previous),
-            KeyCode::Right => self.seek_by(true),
-            KeyCode::Left => self.seek_by(false),
+            KeyCode::Char('w') => self.seek_by(true),
+            KeyCode::Char('b') => self.seek_by(false),
             KeyCode::Char('+' | '=') => self.change_volume(true),
             KeyCode::Char('-') => self.change_volume(false),
             KeyCode::Char('s') => self.act(Action::Shuffle),
@@ -408,9 +408,7 @@ impl App {
 fn is_playback_key(code: KeyCode) -> bool {
     matches!(
         code,
-        KeyCode::Char(' ' | 'n' | 'p' | '[' | ']' | '+' | '=' | '-' | 'm' | 's' | 'r')
-            | KeyCode::Left
-            | KeyCode::Right
+        KeyCode::Char(' ' | 'n' | 'p' | 'w' | 'b' | '[' | ']' | '+' | '=' | '-' | 'm' | 's' | 'r')
     )
 }
 

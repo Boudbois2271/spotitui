@@ -96,7 +96,7 @@ service uses about 35 MB of memory and no measurable CPU.
 | Key | Action | Key | Action |
 | --- | --- | --- | --- |
 | `Space` | play / pause | `n` / `p` | next / previous |
-| `←` / `→` | seek 10 s | `s` / `r` | shuffle / repeat |
+| `b` / `w` | seek 10 s | `s` / `r` | shuffle / repeat |
 | `[` / `]` | volume ±5% | `m` | mute / unmute |
 | `j` / `k` | down / up a row | `l` / `h` | open / back (as in Yazi) |
 | `gg` / `G` | first / last row | `^d` / `^u` | half a screen down / up |
