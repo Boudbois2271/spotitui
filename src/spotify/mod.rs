@@ -19,6 +19,8 @@ pub use auth::{Authorization, Token, forget, store_refresh_token, stored_refresh
 pub use catalog::{Catalog, search_uri};
 pub use library::Liked;
 pub use lyrics::Lyrics;
+#[cfg(test)]
+pub use lyrics::LyricsLine;
 pub use model::{Album, Artist, NowTrack, Playlist, Repeat, Track};
 pub use speaker::{Command, Connection, DEVICE_NAME, Mode, Play, Speaker};
 

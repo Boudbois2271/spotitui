@@ -225,7 +225,134 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ellipsize, wrap};
+    use super::{draw, ellipsize, wrap};
+    use crate::{
+        app::{App, LyricsCache, LyricsStatus, Screen, listing::Loading},
+        client::Service,
+        protocol::{Failure, Kind},
+        spotify::{Album, Artist, Lyrics, LyricsLine, NowTrack, Playlist, Track},
+        theme::ThemeSource,
+    };
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+    use ratatui::{Terminal, backend::TestBackend};
+    use std::rc::Rc;
+
+    /// A window with a list, playlists, a playing track and its lyrics, all with
+    /// long and wide text.
+    fn window() -> App {
+        let (tx, _) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(tx, crate::spotify::http(), ThemeSource::new(), Service::detached());
+        let name = "A rather long title that goes on — 日本語のタイトル 🙏🏻 and more";
+        let track = |index: usize| Track {
+            uri: format!("spotify:track:{index}"),
+            name: format!("{name} {index}"),
+            artists: vec![Artist {
+                uri: "spotify:artist:a".into(),
+                name: "Someone & Someone Else feat. Another".into(),
+            }],
+            album: Album {
+                uri: "spotify:album:a".into(),
+                name: "An album with a very long name (Deluxe Edition) 「DIGITAL」".into(),
+            },
+            duration_ms: 3_725_000,
+        };
+        app.screen = Screen::Library;
+        app.listing.uris = (0..60).map(|index| format!("spotify:track:{index}")).collect();
+        app.listing.tracks = (0..60).map(|index| Rc::new(track(index))).collect();
+        app.listing.requested = 60;
+        app.listing.loading = Loading::Idle;
+        app.playlists = (0..30)
+            .map(|index| {
+                Rc::new(Playlist {
+                    uri: format!("spotify:playlist:{index}"),
+                    name: format!("Playlist with a long name, number {index} 🪩"),
+                    editable: true,
+                })
+            })
+            .collect();
+        app.now.change_track(NowTrack {
+            uri: "spotify:track:3".into(),
+            name: name.into(),
+            artists: vec!["Someone".into(), "Someone Else".into()],
+            album: "An album".into(),
+            album_artists: Vec::new(),
+            duration_ms: 3_725_000,
+            art_url: None,
+        });
+        app.now.report(1_234_567, true);
+        app.lyrics = Some(LyricsCache::new(
+            "spotify:track:3".into(),
+            LyricsStatus::Ready(Rc::new(Lyrics {
+                lines: (0..40)
+                    .map(|index| LyricsLine {
+                        start_ms: Some(index * 60_000),
+                        text: format!("{name} — line {index}"),
+                    })
+                    .collect(),
+                synced: true,
+                provider: "Musixmatch".into(),
+            })),
+        ));
+        app
+    }
+
+    fn press(app: &mut App, code: KeyCode, modifiers: KeyModifiers) {
+        app.input(&Event::Key(KeyEvent::new(code, modifiers)));
+    }
+
+    /// Every screen, overlay and view draws at every size from 1×1, without a
+    /// panic: a window can be squeezed to anything in a tiling layout.
+    #[tokio::test]
+    async fn every_screen_draws_at_every_size() {
+        let none = KeyModifiers::NONE;
+        let failure = Failure::new(Kind::Other, "Something went wrong in a long and winding way ".repeat(4));
+        type Setup = Box<dyn Fn(&mut App)>;
+        let setups: Vec<(&str, Setup)> = vec![
+            ("connecting", Box::new(|app: &mut App| app.screen = Screen::Connecting)),
+            ("logged out", Box::new(|app: &mut App| app.screen = Screen::LoggedOut)),
+            ("failed", Box::new(move |app: &mut App| app.screen = Screen::Failed(failure.clone()))),
+            (
+                "waiting",
+                Box::new(|app: &mut App| {
+                    app.screen = Screen::Waiting(format!("https://accounts.spotify.com/{}", "x".repeat(300)));
+                }),
+            ),
+            ("library", Box::new(|_: &mut App| {})),
+            ("help", Box::new(move |app: &mut App| press(app, KeyCode::Char('?'), none))),
+            ("picker", Box::new(move |app: &mut App| press(app, KeyCode::Char('A'), none))),
+            (
+                "finder",
+                Box::new(move |app: &mut App| {
+                    press(app, KeyCode::Char('f'), KeyModifiers::CONTROL);
+                    press(app, KeyCode::Char('a'), none);
+                }),
+            ),
+            ("lyrics", Box::new(move |app: &mut App| press(app, KeyCode::Char('L'), none))),
+            ("search", Box::new(move |app: &mut App| press(app, KeyCode::Char('/'), none))),
+            ("sidebar", Box::new(move |app: &mut App| press(app, KeyCode::Char('h'), none))),
+        ];
+        // Every small size, then a few at each step of the layout.
+        let widths = (1..=8u16).chain([12, 20, 30, 40, 60, 71, 72, 90, 120, 200]);
+        let heights = (1..=6u16).chain([8, 12, 24, 40]);
+        let sizes = widths
+            .flat_map(|width| heights.clone().map(move |height| (width, height)))
+            .chain([(300, 3), (3, 100)]);
+        let sizes: Vec<(u16, u16)> = sizes.collect();
+        for (label, setup) in &setups {
+            let mut app = window();
+            setup(&mut app);
+            for &(width, height) in &sizes {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).expect("a test terminal");
+                let drawn = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    terminal.draw(|frame| draw(frame, &mut app)).map(|_| ())
+                }));
+                assert!(
+                    matches!(drawn, Ok(Ok(()))),
+                    "the {label} screen fails to draw at {width}×{height}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn long_text_is_shortened_with_an_ellipsis() {
