@@ -724,7 +724,8 @@ Panel {
                   anchors.leftMargin: Style.space(10)
                   anchors.right: parent.right
                   anchors.rightMargin: Style.space(8)
-                  anchors.verticalCenter: parent.verticalCenter
+                  // Same text line as the title (smaller text centred on its own sits higher).
+                  anchors.baseline: titleText.baseline
                   textFormat: Text.PlainText
                   text: row.artist
                   color: root.bar.foreground
