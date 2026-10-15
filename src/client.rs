@@ -148,6 +148,8 @@ async fn maintain(
         match UnixStream::connect(&path).await {
             Ok(stream) => {
                 attempts = 0;
+                // A service that goes away later is started again too.
+                started = false;
                 notify(Notification::Connected);
                 if !session(stream, &mut queue, &notify).await {
                     return;
